@@ -1,0 +1,205 @@
+name: Build & Release ilspycmd (self-contained)
+
+# 定时检测 icsharpcode/ILSpy 是否有新版本，如果有，就把其中的命令行工具
+# ilspycmd（源码目录名一般是 ICSharpCode.Decompiler.Console）编译成
+# self-contained（自带 .NET 运行时，目标机器无需安装 dotnet SDK/Runtime）
+# 的以下 5 个平台包，并发布到本仓库的 Release：
+#   linux-arm64 / linux-musl-arm64 / linux-musl-x64 / linux-x64 / win-x64
+
+on:
+  schedule:
+    # UTC 时间每天 03:00 检测一次（北京时间 11:00），可按需修改 cron 表达式
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      force_version:
+        description: '强制指定要构建的 ILSpy 版本 tag（例如 v11.0-rc），留空则自动检测上游最新正式版'
+        required: false
+        default: ''
+      include_prerelease:
+        description: '自动检测时是否包含预发布版本（rc / preview）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # 需要写权限才能创建 Release；仓库 Settings -> Actions -> General
+                    # -> Workflow permissions 里也要选 "Read and write permissions"
+
+env:
+  UPSTREAM_REPO: icsharpcode/ILSpy
+
+jobs:
+  # ---------------------------------------------------------------------
+  # 第 1 步：检测上游版本，决定要不要构建
+  # ---------------------------------------------------------------------
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.detect.outputs.version }}
+      should_build: ${{ steps.detect.outputs.should_build }}
+      prerelease: ${{ steps.detect.outputs.prerelease }}
+      release_url: ${{ steps.detect.outputs.release_url }}
+    steps:
+      - name: 检测上游最新版本
+        id: detect
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE_VERSION: ${{ github.event.inputs.force_version }}
+          INCLUDE_PRE: ${{ github.event.inputs.include_prerelease }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${FORCE_VERSION:-}" ]; then
+            TAG="$FORCE_VERSION"
+            PRERELEASE="false"
+            RELEASE_URL="https://github.com/${UPSTREAM_REPO}/releases/tag/${TAG}"
+            echo "手动指定版本: $TAG"
+          else
+            if [ "${INCLUDE_PRE:-false}" = "true" ]; then
+              RELEASE_JSON=$(curl -sSL -H "Authorization: Bearer ${GH_TOKEN}" \
+                "https://api.github.com/repos/${UPSTREAM_REPO}/releases?per_page=10" \
+                | jq '[.[] | select(.draft==false)] | sort_by(.published_at) | reverse | .[0]')
+            else
+              RELEASE_JSON=$(curl -sSL -H "Authorization: Bearer ${GH_TOKEN}" \
+                "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest")
+            fi
+            TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+            PRERELEASE=$(echo "$RELEASE_JSON" | jq -r '.prerelease')
+            RELEASE_URL=$(echo "$RELEASE_JSON" | jq -r '.html_url')
+            echo "上游最新版本: $TAG (prerelease=$PRERELEASE)"
+          fi
+
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "未能获取到上游版本号" >&2
+            exit 1
+          fi
+
+          # 检查本仓库是否已经发布过这个版本，避免重复构建
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "本仓库已存在 release ${TAG}，跳过本次构建"
+            SHOULD_BUILD=false
+          else
+            SHOULD_BUILD=true
+          fi
+
+          {
+            echo "version=$TAG"
+            echo "should_build=$SHOULD_BUILD"
+            echo "prerelease=$PRERELEASE"
+            echo "release_url=$RELEASE_URL"
+          } >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------
+  # 第 2 步：按 5 个 RID 并行构建 self-contained 包
+  #   注：dotnet publish --self-contained 本身就是跨平台发布，
+  #   不需要真的在 Windows/对应架构机器上跑，全部放在 ubuntu-latest 即可
+  # ---------------------------------------------------------------------
+  build:
+    needs: check-version
+    if: needs.check-version.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rid:
+          - linux-arm64
+          - linux-musl-arm64
+          - linux-musl-x64
+          - linux-x64
+          - win-x64
+    steps:
+      - name: 检出 ILSpy 源码 (${{ needs.check-version.outputs.version }})
+        uses: actions/checkout@v4
+        with:
+          repository: icsharpcode/ILSpy
+          ref: ${{ needs.check-version.outputs.version }}
+          submodules: false          # 构建 ilspycmd 用不到 ILSpy-Tests 子模块
+          path: ilspy-src
+
+      - name: 安装 .NET SDK（按上游 global.json 自动匹配版本）
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: ilspy-src/global.json
+          # 如果上游某天把 global.json 指向了尚未正式发布(GA)的预览版 SDK，
+          # 取消下面这行的注释即可：
+          # dotnet-quality: 'preview'
+
+      - name: 定位 ilspycmd 项目文件
+        id: locate
+        working-directory: ilspy-src
+        run: |
+          set -euo pipefail
+          # 不写死路径，直接按 ToolCommandName 特征搜索，防止上游以后改目录结构
+          CSPROJ=$(grep -rl "<ToolCommandName>ilspycmd" --include="*.csproj" . | head -n1)
+          if [ -z "$CSPROJ" ]; then
+            echo "未找到 ilspycmd 项目文件" >&2
+            exit 1
+          fi
+          echo "找到项目文件: $CSPROJ"
+          echo "csproj=$CSPROJ" >> "$GITHUB_OUTPUT"
+
+      - name: 发布 self-contained (${{ matrix.rid }})
+        working-directory: ilspy-src
+        run: |
+          set -euo pipefail
+          dotnet publish "${{ steps.locate.outputs.csproj }}" \
+            -c Release \
+            -r ${{ matrix.rid }} \
+            --self-contained true \
+            -p:PublishSingleFile=false \
+            -o "../out/${{ matrix.rid }}"
+
+      - name: 打包 zip
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          VERSION="${{ needs.check-version.outputs.version }}"
+          cd "out/${{ matrix.rid }}"
+          zip -r -9 -q "../../dist/ilspycmd-${VERSION}-${{ matrix.rid }}.zip" .
+          cd ../..
+          ls -lh dist
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ilspycmd-${{ matrix.rid }}
+          path: dist/*.zip
+          retention-days: 3
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------
+  # 第 3 步：汇总所有产物，发布到本仓库 Release
+  # ---------------------------------------------------------------------
+  publish:
+    needs: [check-version, build]
+    if: needs.check-version.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载所有构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: ilspycmd-*
+          merge-multiple: true
+
+      - name: 发布 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-version.outputs.version }}
+          name: "ilspycmd ${{ needs.check-version.outputs.version }} (self-contained)"
+          prerelease: ${{ needs.check-version.outputs.prerelease == 'true' }}
+          body: |
+            自动构建自 [icsharpcode/ILSpy@${{ needs.check-version.outputs.version }}](${{ needs.check-version.outputs.release_url }}) 的 `ilspycmd` self-contained 版本。
+
+            **特点**：压缩包内已包含对应平台的 .NET 运行时，解压即可直接运行，目标机器无需安装 .NET SDK/Runtime。
+
+            | 平台 | 文件 |
+            | --- | --- |
+            | Linux x64 (glibc，如 Ubuntu/Debian/CentOS) | `ilspycmd-${{ needs.check-version.outputs.version }}-linux-x64.zip` |
+            | Linux arm64 (glibc) | `ilspycmd-${{ needs.check-version.outputs.version }}-linux-arm64.zip` |
+            | Linux x64 (musl，如 Alpine) | `ilspycmd-${{ needs.check-version.outputs.version }}-linux-musl-x64.zip` |
+            | Linux arm64 (musl) | `ilspycmd-${{ needs.check-version.outputs.version }}-linux-musl-arm64.zip` |
+            | Windows x64 | `ilspycmd-${{ needs.check-version.outputs.version }}-win-x64.zip` |
+
+            本 Release 由 GitHub Actions 定时自动生成，非 ILSpy 官方发布。
+          files: artifacts/*.zip

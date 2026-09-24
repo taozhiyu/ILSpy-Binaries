@@ -142,20 +142,50 @@ jobs:
           - win-x64
     steps:
       - name: 检出 ILSpy 源码 (${{ needs.check-version.outputs.version }})
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: icsharpcode/ILSpy
           ref: ${{ needs.check-version.outputs.version }}
           submodules: false          # 构建 ilspycmd 用不到 ILSpy-Tests 子模块
           path: ilspy-src
 
-      - name: 安装 .NET SDK（按上游 global.json 自动匹配版本）
-        uses: actions/setup-dotnet@v5
+      # 上游 global.json 里 sdk.version 写的是 "11.0.0" 这种非完整版本号，
+      # 同时又设置了 rollForward —— actions/setup-dotnet 解析
+      # global-json-file 时会严格校验这种组合必须是完整 SDK 版本号
+      # （如 11.0.100），"11.0.0" 会直接报错：
+      #   Error: Version '11.0.0' is not valid for the 'sdk.version' value
+      #   in global.json. When 'rollForward' is specified, a full SDK
+      #   version is required.
+      # 所以不再依赖 global-json-file 自动解析，改为显式安装我们自己
+      # 确定需要的 SDK 版本（README 里写的是：运行/构建只需要 .NET 10.0
+      # SDK，.NET 11.0 SDK 只有跑单元测试才需要——我们不跑测试，多装一个
+      # 11.0.x preview 只是给上游以后升级 TFM 留个保险）。同时清掉
+      # global.json 里的 sdk 锁定段，避免 dotnet CLI 自己在 restore/publish
+      # 时又按同样规则解析报错，但保留 msbuild-sdks 等其它段落不动。
+      - name: 清理 global.json 里的 SDK 版本锁定
+        working-directory: ilspy-src
+        run: |
+          set -euo pipefail
+          if [ -f global.json ]; then
+            echo "补丁前:"
+            cat global.json
+            jq 'del(.sdk)' global.json > global.json.tmp && mv global.json.tmp global.json
+            echo "补丁后:"
+            cat global.json
+          else
+            echo "未找到 global.json，跳过"
+          fi
+
+      - name: 安装 .NET SDK
+        uses: actions/setup-dotnet@v6
         with:
-          global-json-file: ilspy-src/global.json
-          # 如果上游某天把 global.json 指向了尚未正式发布(GA)的预览版 SDK，
-          # 取消下面这行的注释即可：
-          # dotnet-quality: 'preview'
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+            11.0.x
+          dotnet-quality: 'preview'   # 8/9/10 已 GA，实际仍会装到各自最新正式版；
+                                       # 11.0.x 目前是 preview，需要这个开关才能装上
 
       - name: 定位 ilspycmd 项目文件
         id: locate

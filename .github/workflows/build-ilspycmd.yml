@@ -1,10 +1,16 @@
 name: Build & Release ilspycmd (self-contained)
 
-# 定时检测 icsharpcode/ILSpy 是否有新版本，如果有，就把其中的命令行工具
-# ilspycmd（源码目录名一般是 ICSharpCode.Decompiler.Console）编译成
-# self-contained（自带 .NET 运行时，目标机器无需安装 dotnet SDK/Runtime）
-# 的以下 5 个平台包，并发布到本仓库的 Release：
+# 定时检测 icsharpcode/ILSpy 是否有新版本，如果有（或已发布但资产不全），
+# 就把其中的命令行工具 ilspycmd 编译成 self-contained（自带 .NET 运行时，
+# 目标机器无需安装 dotnet SDK/Runtime）的以下 5 个平台包，并发布到本仓库
+# 的 Release：
 #   linux-arm64 / linux-musl-arm64 / linux-musl-x64 / linux-x64 / win-x64
+#
+# Periodically checks icsharpcode/ILSpy for a new version. If found (or an
+# existing release is missing assets), builds ilspycmd as a self-contained
+# (bundled .NET runtime, no SDK/Runtime needed on the target machine)
+# package for the 5 platforms above and publishes them to this repo's
+# Releases.
 
 on:
   schedule:
@@ -22,15 +28,17 @@ on:
         default: false
 
 permissions:
-  contents: write   # 需要写权限才能创建 Release；仓库 Settings -> Actions -> General
-                    # -> Workflow permissions 里也要选 "Read and write permissions"
+  contents: write   # 需要写权限才能创建/更新 Release；仓库 Settings -> Actions -> General
+                     # -> Workflow permissions 里也要选 "Read and write permissions"
 
 env:
   UPSTREAM_REPO: icsharpcode/ILSpy
+  # 5 个平台包的文件名后缀，check-version / build / publish 三个 job 共用同一份定义
+  RID_LIST: "linux-arm64 linux-musl-arm64 linux-musl-x64 linux-x64 win-x64"
 
 jobs:
   # ---------------------------------------------------------------------
-  # 第 1 步：检测上游版本，决定要不要构建
+  # 第 1 步：检测上游版本 + 校验本仓库该版本的 5 个资产是否齐全
   # ---------------------------------------------------------------------
   check-version:
     runs-on: ubuntu-latest
@@ -40,7 +48,7 @@ jobs:
       prerelease: ${{ steps.detect.outputs.prerelease }}
       release_url: ${{ steps.detect.outputs.release_url }}
     steps:
-      - name: 检测上游最新版本
+      - name: 检测上游版本并校验本仓库资产完整性
         id: detect
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -51,15 +59,26 @@ jobs:
 
           if [ -n "${FORCE_VERSION:-}" ]; then
             TAG="$FORCE_VERSION"
-            PRERELEASE="false"
-            RELEASE_URL="https://github.com/${UPSTREAM_REPO}/releases/tag/${TAG}"
             echo "手动指定版本: $TAG"
+            # 手动指定时也去上游查一下这个 tag 真实的 prerelease 状态，
+            # 而不是简单写死 false —— 否则 rc/preview 会被当成正式版发布
+            RELEASE_JSON=$(curl -sSL -H "Authorization: Bearer ${GH_TOKEN}" \
+              "https://api.github.com/repos/${UPSTREAM_REPO}/releases/tags/${TAG}")
+            if [ "$(echo "$RELEASE_JSON" | jq -r '.message // empty')" = "Not Found" ]; then
+              echo "上游不存在 tag ${TAG} 对应的 Release，请检查输入" >&2
+              exit 1
+            fi
+            PRERELEASE=$(echo "$RELEASE_JSON" | jq -r '.prerelease')
+            RELEASE_URL=$(echo "$RELEASE_JSON" | jq -r '.html_url')
           else
             if [ "${INCLUDE_PRE:-false}" = "true" ]; then
+              # 明确语义：只排除 draft，其余按发布时间倒序取第一个
+              # （无论是否 prerelease）
               RELEASE_JSON=$(curl -sSL -H "Authorization: Bearer ${GH_TOKEN}" \
                 "https://api.github.com/repos/${UPSTREAM_REPO}/releases?per_page=10" \
                 | jq '[.[] | select(.draft==false)] | sort_by(.published_at) | reverse | .[0]')
             else
+              # /releases/latest 官方语义就是"最新的非 draft、非 prerelease"
               RELEASE_JSON=$(curl -sSL -H "Authorization: Bearer ${GH_TOKEN}" \
                 "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest")
             fi
@@ -74,12 +93,26 @@ jobs:
             exit 1
           fi
 
-          # 检查本仓库是否已经发布过这个版本，避免重复构建
-          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "本仓库已存在 release ${TAG}，跳过本次构建"
-            SHOULD_BUILD=false
-          else
-            SHOULD_BUILD=true
+          # 不只判断 Release 是否存在，还要判断 5 个平台包是否都在，
+          # 否则某次构建部分失败后，后续检测会因为"tag 已存在"而永久跳过
+          SHOULD_BUILD=true
+          if gh release view "$TAG" --repo "${{ github.repository }}" --json assets \
+              > /tmp/existing-release.json 2>/dev/null; then
+            MISSING=false
+            for rid in ${RID_LIST}; do
+              NAME="ilspycmd-${TAG}-${rid}.zip"
+              if ! jq -e --arg n "$NAME" '.assets[]? | select(.name == $n)' \
+                  /tmp/existing-release.json > /dev/null; then
+                echo "缺少资产: $NAME"
+                MISSING=true
+              fi
+            done
+            if [ "$MISSING" = "false" ]; then
+              echo "本仓库 release ${TAG} 已存在且 5 个资产齐全，跳过构建"
+              SHOULD_BUILD=false
+            else
+              echo "本仓库 release ${TAG} 存在但资产不全，重新构建补齐"
+            fi
           fi
 
           {
@@ -109,7 +142,7 @@ jobs:
           - win-x64
     steps:
       - name: 检出 ILSpy 源码 (${{ needs.check-version.outputs.version }})
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: icsharpcode/ILSpy
           ref: ${{ needs.check-version.outputs.version }}
@@ -117,7 +150,7 @@ jobs:
           path: ilspy-src
 
       - name: 安装 .NET SDK（按上游 global.json 自动匹配版本）
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v5
         with:
           global-json-file: ilspy-src/global.json
           # 如果上游某天把 global.json 指向了尚未正式发布(GA)的预览版 SDK，
@@ -129,7 +162,9 @@ jobs:
         working-directory: ilspy-src
         run: |
           set -euo pipefail
-          # 不写死路径，直接按 ToolCommandName 特征搜索，防止上游以后改目录结构
+          # 不写死路径（上游曾把目录从 ICSharpCode.Decompiler.Console
+          # 改名为 ICSharpCode.ILSpyCmd），按 ToolCommandName 特征搜索，
+          # 防止上游以后再次改目录结构
           CSPROJ=$(grep -rl "<ToolCommandName>ilspycmd" --include="*.csproj" . | head -n1)
           if [ -z "$CSPROJ" ]; then
             echo "未找到 ilspycmd 项目文件" >&2
@@ -138,16 +173,65 @@ jobs:
           echo "找到项目文件: $CSPROJ"
           echo "csproj=$CSPROJ" >> "$GITHUB_OUTPUT"
 
-      - name: 发布 self-contained (${{ matrix.rid }})
+      # 上游项目已开启 <RestoreLockedMode>true</RestoreLockedMode>，
+      # 默认的隐式 restore 会因为 packages.lock.json 校验失败而报错，
+      # 所以显式拆成 restore + publish --no-restore 两步，
+      # 并关闭锁定模式与包裁剪（对齐上游官方构建脚本的做法）
+      - name: Restore (${{ matrix.rid }})
+        working-directory: ilspy-src
+        run: |
+          set -euo pipefail
+          dotnet restore "${{ steps.locate.outputs.csproj }}" \
+            -r "${{ matrix.rid }}" \
+            -p:RestoreLockedMode=false \
+            -p:RestoreEnablePackagePruning=false
+
+      # -p:DebugType=none -p:DebugSymbols=false：从源头不生成托管 .pdb，
+      # 比发布后再删更干净（不会有编译器先写盘、再被删除的浪费）
+      - name: Publish self-contained (${{ matrix.rid }})
         working-directory: ilspy-src
         run: |
           set -euo pipefail
           dotnet publish "${{ steps.locate.outputs.csproj }}" \
             -c Release \
-            -r ${{ matrix.rid }} \
+            -r "${{ matrix.rid }}" \
             --self-contained true \
+            --no-restore \
             -p:PublishSingleFile=false \
+            -p:DebugType=none \
+            -p:DebugSymbols=false \
             -o "../out/${{ matrix.rid }}"
+
+      # 清理发布产物里编译参数关不掉的"垃圾"：
+      #   *.dbg        —— Linux 下 native 运行时组件的独立调试符号，通常是体积大头
+      #   createdump   —— Linux/macOS 下用于生成崩溃 core dump 的小工具，CLI 用不上
+      #   *.pdb        —— 以防个别第三方依赖仍带着预编译好的 pdb 被复制进来
+      #   *.xml        —— API 文档注释（IntelliSense 用），压缩包里没意义
+      # 清理前后都打印一下体积，方便核对到底删了多少
+      - name: 清理调试符号与无用文件 (${{ matrix.rid }})
+        run: |
+          set -euo pipefail
+          OUT_DIR="out/${{ matrix.rid }}"
+          echo "清理前体积:"
+          du -sh "$OUT_DIR"
+
+          echo "将要删除的文件："
+          find "$OUT_DIR" -type f \( \
+              -name "*.dbg" -o \
+              -name "*.pdb" -o \
+              -name "*.xml" -o \
+              -name "createdump" \
+            \) -print
+
+          find "$OUT_DIR" -type f \( \
+              -name "*.dbg" -o \
+              -name "*.pdb" -o \
+              -name "*.xml" -o \
+              -name "createdump" \
+            \) -delete
+
+          echo "清理后体积:"
+          du -sh "$OUT_DIR"
 
       - name: 打包 zip
         run: |
@@ -168,7 +252,7 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------
-  # 第 3 步：汇总所有产物，发布到本仓库 Release
+  # 第 3 步：汇总所有产物，发布/更新到本仓库 Release
   # ---------------------------------------------------------------------
   publish:
     needs: [check-version, build]
@@ -189,17 +273,22 @@ jobs:
           name: "ilspycmd ${{ needs.check-version.outputs.version }} (self-contained)"
           prerelease: ${{ needs.check-version.outputs.prerelease == 'true' }}
           body: |
-            自动构建自 [icsharpcode/ILSpy@${{ needs.check-version.outputs.version }}](${{ needs.check-version.outputs.release_url }}) 的 `ilspycmd` self-contained 版本。
+            ## 简介 / Overview
 
-            **特点**：压缩包内已包含对应平台的 .NET 运行时，解压即可直接运行，目标机器无需安装 .NET SDK/Runtime。
+            自动构建自 [icsharpcode/ILSpy@${{ needs.check-version.outputs.version }}](${{ needs.check-version.outputs.release_url }}) 的 `ilspycmd` self-contained 版本。压缩包内已包含对应平台的 .NET 运行时，解压即可直接运行，**目标机器无需安装 .NET SDK/Runtime**。已移除调试符号（`*.pdb` / `*.dbg`）、`createdump` 及 API 文档注释（`*.xml`）等对最终用户无用的文件，仅保留运行所需内容。
 
-            | 平台 | 文件 |
+            Self-contained build of `ilspycmd`, automatically compiled from [icsharpcode/ILSpy@${{ needs.check-version.outputs.version }}](${{ needs.check-version.outputs.release_url }}). Each archive bundles its own .NET runtime — **no .NET SDK/Runtime installation is required** on the target machine. Debug symbols (`*.pdb` / `*.dbg`), the `createdump` crash-dump helper, and API doc-comment `*.xml` files have been stripped, leaving only what's needed to run.
+
+            本 Release 由 GitHub Actions 定时自动生成，非 ILSpy 官方发布。
+            This release is generated automatically on a schedule by GitHub Actions and is **not** an official ILSpy release.
+
+            ## 下载 / Downloads
+
+            | 平台 / Platform | 文件 / File |
             | --- | --- |
             | Linux x64 (glibc，如 Ubuntu/Debian/CentOS) | `ilspycmd-${{ needs.check-version.outputs.version }}-linux-x64.zip` |
             | Linux arm64 (glibc) | `ilspycmd-${{ needs.check-version.outputs.version }}-linux-arm64.zip` |
             | Linux x64 (musl，如 Alpine) | `ilspycmd-${{ needs.check-version.outputs.version }}-linux-musl-x64.zip` |
             | Linux arm64 (musl) | `ilspycmd-${{ needs.check-version.outputs.version }}-linux-musl-arm64.zip` |
             | Windows x64 | `ilspycmd-${{ needs.check-version.outputs.version }}-win-x64.zip` |
-
-            本 Release 由 GitHub Actions 定时自动生成，非 ILSpy 官方发布。
           files: artifacts/*.zip

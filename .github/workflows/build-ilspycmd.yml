@@ -11,6 +11,15 @@ name: Build & Release ilspycmd (self-contained)
 # (bundled .NET runtime, no SDK/Runtime needed on the target machine)
 # package for the 5 platforms above and publishes them to this repo's
 # Releases.
+#
+# 安全设计要点（本 workflow 会自动编译并执行第三方源码，按"供应链系统"对待）：
+#   1. 权限最小化：默认只读，只有 publish job 才有 contents: write
+#   2. build job 检出第三方源码时不保留 git 凭据（persist-credentials: false）
+#   3. 所有第三方 Action 固定到完整 commit SHA（由 Dependabot 自动提 PR 升级）
+#   4. 检测阶段把 tag 解析成 commit SHA，构建阶段直接按 SHA 检出，
+#      避免"检测时和构建时 tag 指向不同 commit"
+#   5. run 脚本里不直接插值 ${{ }}，统一走环境变量，避免脚本注入
+#   6. 发布 SHA256SUMS，并对可原生运行的平台做冒烟测试
 
 on:
   schedule:
@@ -27,23 +36,32 @@ on:
         type: boolean
         default: false
 
+# 全局默认只读；需要写权限的 job（publish）单独声明
 permissions:
-  contents: write   # 需要写权限才能创建/更新 Release；仓库 Settings -> Actions -> General
-                     # -> Workflow permissions 里也要选 "Read and write permissions"
+  contents: read
+
+# 同一时间只允许一个发布流程运行，防止"定时任务 + 手动触发"并发改同一个 Release。
+# cancel-in-progress 必须是 false：发布到一半被取消会留下半成品。
+concurrency:
+  group: ilspycmd-release
+  cancel-in-progress: false
 
 env:
   UPSTREAM_REPO: icsharpcode/ILSpy
-  # 5 个平台包的文件名后缀，check-version / build / publish 三个 job 共用同一份定义
+  # 5 个平台包的 RID 列表，用于校验已发布 Release 的资产是否齐全
   RID_LIST: "linux-arm64 linux-musl-arm64 linux-musl-x64 linux-x64 win-x64"
 
 jobs:
   # ---------------------------------------------------------------------
-  # 第 1 步：检测上游版本 + 校验本仓库该版本的 5 个资产是否齐全
+  # 第 1 步：检测上游版本 -> 解析 commit SHA -> 校验本仓库资产是否齐全
   # ---------------------------------------------------------------------
   check-version:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     outputs:
       version: ${{ steps.detect.outputs.version }}
+      commit: ${{ steps.detect.outputs.commit }}
       should_build: ${{ steps.detect.outputs.should_build }}
       prerelease: ${{ steps.detect.outputs.prerelease }}
       release_url: ${{ steps.detect.outputs.release_url }}
@@ -52,51 +70,77 @@ jobs:
         id: detect
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           FORCE_VERSION: ${{ github.event.inputs.force_version }}
           INCLUDE_PRE: ${{ github.event.inputs.include_prerelease }}
         run: |
           set -euo pipefail
 
+          # 统一的 API 调用封装：HTTP 错误直接失败（-f），网络抖动自动重试，
+          # 避免 403/429/5xx 被悄悄吞掉，后面才冒出难懂的 "null" 错误
+          gh_api() {
+            curl -fsS --retry 3 --retry-all-errors \
+              --connect-timeout 10 --max-time 60 \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "$1"
+          }
+
+          # ---- A. 确定要构建的 tag ----
           if [ -n "${FORCE_VERSION:-}" ]; then
-            TAG="$FORCE_VERSION"
-            echo "手动指定版本: $TAG"
-            # 手动指定时也去上游查一下这个 tag 真实的 prerelease 状态，
-            # 而不是简单写死 false —— 否则 rc/preview 会被当成正式版发布
-            RELEASE_JSON=$(curl -sSL -H "Authorization: Bearer ${GH_TOKEN}" \
-              "https://api.github.com/repos/${UPSTREAM_REPO}/releases/tags/${TAG}")
-            if [ "$(echo "$RELEASE_JSON" | jq -r '.message // empty')" = "Not Found" ]; then
-              echo "上游不存在 tag ${TAG} 对应的 Release，请检查输入" >&2
+            # 手动输入的版本号先做格式校验，只允许常见 tag 字符
+            if ! printf '%s' "$FORCE_VERSION" | grep -Eq '^[A-Za-z0-9._+-]+$'; then
+              echo "force_version 含有非法字符: $FORCE_VERSION" >&2
               exit 1
             fi
-            PRERELEASE=$(echo "$RELEASE_JSON" | jq -r '.prerelease')
-            RELEASE_URL=$(echo "$RELEASE_JSON" | jq -r '.html_url')
+            TAG="$FORCE_VERSION"
+            echo "手动指定版本: $TAG"
+            # 手动指定时也去上游查这个 tag 真实的 prerelease 状态，不写死 false
+            RELEASE_JSON=$(gh_api "https://api.github.com/repos/${UPSTREAM_REPO}/releases/tags/${TAG}")
           else
             if [ "${INCLUDE_PRE:-false}" = "true" ]; then
-              # 明确语义：只排除 draft，其余按发布时间倒序取第一个
-              # （无论是否 prerelease）
-              RELEASE_JSON=$(curl -sSL -H "Authorization: Bearer ${GH_TOKEN}" \
-                "https://api.github.com/repos/${UPSTREAM_REPO}/releases?per_page=10" \
+              # 只排除 draft，其余（含 prerelease）按发布时间倒序取第一个
+              RELEASE_JSON=$(gh_api "https://api.github.com/repos/${UPSTREAM_REPO}/releases?per_page=100" \
                 | jq '[.[] | select(.draft==false)] | sort_by(.published_at) | reverse | .[0]')
             else
-              # /releases/latest 官方语义就是"最新的非 draft、非 prerelease"
-              RELEASE_JSON=$(curl -sSL -H "Authorization: Bearer ${GH_TOKEN}" \
-                "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest")
+              # /releases/latest 的官方语义：最新的非 draft、非 prerelease
+              RELEASE_JSON=$(gh_api "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest")
             fi
-            TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
-            PRERELEASE=$(echo "$RELEASE_JSON" | jq -r '.prerelease')
-            RELEASE_URL=$(echo "$RELEASE_JSON" | jq -r '.html_url')
-            echo "上游最新版本: $TAG (prerelease=$PRERELEASE)"
           fi
+
+          TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+          PRERELEASE=$(echo "$RELEASE_JSON" | jq -r '.prerelease')
+          RELEASE_URL=$(echo "$RELEASE_JSON" | jq -r '.html_url')
+          echo "上游版本: $TAG (prerelease=$PRERELEASE)"
 
           if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
             echo "未能获取到上游版本号" >&2
             exit 1
           fi
 
-          # 不只判断 Release 是否存在，还要判断 5 个平台包是否都在，
-          # 否则某次构建部分失败后，后续检测会因为"tag 已存在"而永久跳过
+          # ---- B. tag -> commit SHA ----
+          # 后续构建直接按 commit SHA 检出，保证"检测的"和"构建的"是同一份源码
+          REF_JSON=$(gh_api "https://api.github.com/repos/${UPSTREAM_REPO}/git/refs/tags/${TAG}")
+          OBJ_TYPE=$(echo "$REF_JSON" | jq -r '.object.type // empty')
+          OBJ_SHA=$(echo "$REF_JSON" | jq -r '.object.sha // empty')
+          if [ -z "$OBJ_SHA" ]; then
+            echo "无法解析 tag ${TAG} 对应的 commit" >&2
+            exit 1
+          fi
+          if [ "$OBJ_TYPE" = "tag" ]; then
+            # annotated tag：再解一层拿到真正指向的 commit
+            TAG_JSON=$(gh_api "https://api.github.com/repos/${UPSTREAM_REPO}/git/tags/${OBJ_SHA}")
+            COMMIT_SHA=$(echo "$TAG_JSON" | jq -r '.object.sha')
+          else
+            COMMIT_SHA="$OBJ_SHA"
+          fi
+          echo "tag ${TAG} -> commit ${COMMIT_SHA}"
+
+          # ---- C. 校验本仓库该版本的 5 个资产是否齐全 ----
+          # 不只判断 Release 是否存在：某次构建部分失败后，Release 可能缺文件，
+          # 只判断存在性会导致永久跳过
           SHOULD_BUILD=true
-          if gh release view "$TAG" --repo "${{ github.repository }}" --json assets \
+          if gh release view "$TAG" --repo "$GH_REPO" --json assets \
               > /tmp/existing-release.json 2>/dev/null; then
             MISSING=false
             for rid in ${RID_LIST}; do
@@ -117,6 +161,7 @@ jobs:
 
           {
             echo "version=$TAG"
+            echo "commit=$COMMIT_SHA"
             echo "should_build=$SHOULD_BUILD"
             echo "prerelease=$PRERELEASE"
             echo "release_url=$RELEASE_URL"
@@ -124,13 +169,19 @@ jobs:
 
   # ---------------------------------------------------------------------
   # 第 2 步：按 5 个 RID 并行构建 self-contained 包
-  #   注：dotnet publish --self-contained 本身就是跨平台发布，
-  #   不需要真的在 Windows/对应架构机器上跑，全部放在 ubuntu-latest 即可
+  #   这个 job 会执行第三方源码（MSBuild / NuGet），所以只给只读权限，
+  #   且检出时不保留 git 凭据。
+  #   dotnet publish --self-contained 本身是跨平台发布，全部放在 Linux
+  #   runner 上即可，不需要 Windows / ARM 机器。
+  #   任意一个 RID 失败 -> build job 整体失败 -> publish 不会运行，
+  #   天然实现"5 个全部成功才发布"。
   # ---------------------------------------------------------------------
   build:
     needs: check-version
     if: needs.check-version.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -140,164 +191,209 @@ jobs:
           - linux-musl-x64
           - linux-x64
           - win-x64
+    # 统一通过环境变量传递，脚本里一律用 $VERSION / $COMMIT / $RID，
+    # 不在 run 脚本里直接写 ${{ }}（防脚本注入）
+    env:
+      VERSION: ${{ needs.check-version.outputs.version }}
+      COMMIT: ${{ needs.check-version.outputs.commit }}
+      RID: ${{ matrix.rid }}
     steps:
-      - name: 检出 ILSpy 源码 (${{ needs.check-version.outputs.version }})
-        uses: actions/checkout@v7
+      - name: 检出 ILSpy 源码（按 commit SHA，不保留凭据）
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: icsharpcode/ILSpy
-          ref: ${{ needs.check-version.outputs.version }}
+          ref: ${{ needs.check-version.outputs.commit }}
           submodules: false          # 构建 ilspycmd 用不到 ILSpy-Tests 子模块
+          persist-credentials: false # 第三方代码不应接触 git 凭据
           path: ilspy-src
 
-      # 上游 global.json 里 sdk.version 写的是 "11.0.0" 这种非完整版本号，
-      # 同时又设置了 rollForward —— actions/setup-dotnet 解析
-      # global-json-file 时会严格校验这种组合必须是完整 SDK 版本号
-      # （如 11.0.100），"11.0.0" 会直接报错：
-      #   Error: Version '11.0.0' is not valid for the 'sdk.version' value
-      #   in global.json. When 'rollForward' is specified, a full SDK
-      #   version is required.
-      # 所以不再依赖 global-json-file 自动解析，改为显式安装我们自己
-      # 确定需要的 SDK 版本（README 里写的是：运行/构建只需要 .NET 10.0
-      # SDK，.NET 11.0 SDK 只有跑单元测试才需要——我们不跑测试，多装一个
-      # 11.0.x preview 只是给上游以后升级 TFM 留个保险）。同时清掉
-      # global.json 里的 sdk 锁定段，避免 dotnet CLI 自己在 restore/publish
-      # 时又按同样规则解析报错，但保留 msbuild-sdks 等其它段落不动。
-      - name: 清理 global.json 里的 SDK 版本锁定
-        working-directory: ilspy-src
+      # 不使用 setup-dotnet 的 global-json-file：上游 global.json 的
+      # sdk.version 写的是 "11.0.0"，setup-dotnet 较新版本对
+      # "非完整版本号 + rollForward" 的组合会直接报错。
+      # ILSpy 官方 CI 本身也没有用 global-json-file，而是直接写死
+      # dotnet-version + dotnet-quality: preview。
+      # 这里的做法：不修改 global.json，只从中读出 major.minor 换算成
+      # channel（如 11.0.0 -> 11.0.x），再显式安装——既适配上游，又不硬编码。
+      - name: 解析上游要求的 SDK channel
+        id: sdkver
         run: |
           set -euo pipefail
-          if [ -f global.json ]; then
-            echo "补丁前:"
-            cat global.json
-            jq 'del(.sdk)' global.json > global.json.tmp && mv global.json.tmp global.json
-            echo "补丁后:"
-            cat global.json
+          RAW=$(jq -r '.sdk.version // empty' ilspy-src/global.json 2>/dev/null || true)
+          if [ -z "$RAW" ]; then
+            echo "global.json 未指定 sdk.version，退回安装 latest"
+            echo "channel=latest" >> "$GITHUB_OUTPUT"
           else
-            echo "未找到 global.json，跳过"
+            CHANNEL="$(echo "$RAW" | cut -d. -f1-2).x"
+            echo "global.json 指定 sdk.version=${RAW}，换算为 channel=${CHANNEL}"
+            echo "channel=${CHANNEL}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: 安装 .NET SDK
-        uses: actions/setup-dotnet@v6
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6
         with:
-          dotnet-version: |
-            8.0.x
-            9.0.x
-            10.0.x
-            11.0.x
-          dotnet-quality: 'preview'   # 8/9/10 已 GA，实际仍会装到各自最新正式版；
-                                       # 11.0.x 目前是 preview，需要这个开关才能装上
+          dotnet-version: ${{ steps.sdkver.outputs.channel }}
+          # 该 channel 若已 GA，仍会装到最新正式版；
+          # 若仍是 preview（如 11.0.x），需要这个开关才能装上
+          dotnet-quality: 'preview'
+
+      # 如果后续 restore/publish 阶段 dotnet CLI 自己也因 global.json 报
+      # "compatible SDK not found"，再启用下面这个兜底（删除 sdk 锁定段，
+      # 保留 msbuild-sdks 等其它内容）。目前按官方 CI 的做法判断不需要。
+      # - name: 兜底：清除 global.json 的 sdk 锁定段
+      #   working-directory: ilspy-src
+      #   run: jq 'del(.sdk)' global.json > global.json.tmp && mv global.json.tmp global.json
 
       - name: 定位 ilspycmd 项目文件
-        id: locate
         working-directory: ilspy-src
         run: |
           set -euo pipefail
           # 不写死路径（上游曾把目录从 ICSharpCode.Decompiler.Console
-          # 改名为 ICSharpCode.ILSpyCmd），按 ToolCommandName 特征搜索，
-          # 防止上游以后再次改目录结构
-          CSPROJ=$(grep -rl "<ToolCommandName>ilspycmd" --include="*.csproj" . | head -n1)
-          if [ -z "$CSPROJ" ]; then
+          # 改名为 ICSharpCode.ILSpyCmd），按 ToolCommandName 特征搜索。
+          # 0 个或多个候选都直接失败，不再随便取第一个。
+          MATCHES=$(grep -rl "<ToolCommandName>ilspycmd" --include="*.csproj" . || true)
+          COUNT=$(printf '%s\n' "$MATCHES" | grep -c . || true)
+          if [ "$COUNT" -eq 0 ]; then
             echo "未找到 ilspycmd 项目文件" >&2
             exit 1
           fi
-          echo "找到项目文件: $CSPROJ"
-          echo "csproj=$CSPROJ" >> "$GITHUB_OUTPUT"
+          if [ "$COUNT" -gt 1 ]; then
+            echo "找到多个候选项目文件，无法自动确定，请人工检查：" >&2
+            printf '%s\n' "$MATCHES" >&2
+            exit 1
+          fi
+          echo "找到项目文件: $MATCHES"
+          echo "CSPROJ=$MATCHES" >> "$GITHUB_ENV"
 
-      # 上游项目已开启 <RestoreLockedMode>true</RestoreLockedMode>，
-      # 默认的隐式 restore 会因为 packages.lock.json 校验失败而报错，
-      # 所以显式拆成 restore + publish --no-restore 两步，
-      # 并关闭锁定模式与包裁剪（对齐上游官方构建脚本的做法）
-      - name: Restore (${{ matrix.rid }})
+      # 优先遵守上游 packages.lock.json（可复现性更好）；
+      # 只有锁定模式失败时（比如该 RID 不在 lock 文件里）才回退为不锁定。
+      - name: Restore（优先遵守上游锁定文件）
+        id: restore_locked
+        working-directory: ilspy-src
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          dotnet restore "$CSPROJ" -r "$RID"
+
+      - name: Restore（锁定模式失败时回退）
+        if: steps.restore_locked.outcome == 'failure'
         working-directory: ilspy-src
         run: |
           set -euo pipefail
-          dotnet restore "${{ steps.locate.outputs.csproj }}" \
-            -r "${{ matrix.rid }}" \
+          echo "锁定模式 restore 失败，回退为 RestoreLockedMode=false 重试"
+          dotnet restore "$CSPROJ" -r "$RID" \
             -p:RestoreLockedMode=false \
             -p:RestoreEnablePackagePruning=false
 
-      # -p:DebugType=none -p:DebugSymbols=false：从源头不生成托管 .pdb，
-      # 比发布后再删更干净（不会有编译器先写盘、再被删除的浪费）
-      - name: Publish self-contained (${{ matrix.rid }})
+      # DebugType=none / DebugSymbols=false：从源头不生成托管 .pdb
+      - name: Publish self-contained
         working-directory: ilspy-src
         run: |
           set -euo pipefail
-          dotnet publish "${{ steps.locate.outputs.csproj }}" \
+          dotnet publish "$CSPROJ" \
             -c Release \
-            -r "${{ matrix.rid }}" \
+            -r "$RID" \
             --self-contained true \
             --no-restore \
             -p:PublishSingleFile=false \
             -p:DebugType=none \
             -p:DebugSymbols=false \
-            -o "../out/${{ matrix.rid }}"
+            -o "../out/${RID}"
 
-      # 清理发布产物里编译参数关不掉的"垃圾"：
-      #   *.dbg        —— Linux 下 native 运行时组件的独立调试符号，通常是体积大头
-      #   createdump   —— Linux/macOS 下用于生成崩溃 core dump 的小工具，CLI 用不上
-      #   *.pdb        —— 以防个别第三方依赖仍带着预编译好的 pdb 被复制进来
-      #   *.xml        —— API 文档注释（IntelliSense 用），压缩包里没意义
-      # 清理前后都打印一下体积，方便核对到底删了多少
-      - name: 清理调试符号与无用文件 (${{ matrix.rid }})
+      # 清理编译参数关不掉的"垃圾"：
+      #   *.dbg       Linux 下 native 运行时组件的独立调试符号（通常体积最大）
+      #   createdump  Linux/macOS 下生成崩溃 core dump 的小工具，CLI 用不上
+      #   *.pdb       以防个别第三方依赖自带预编译 pdb
+      #   *.xml       API 文档注释
+      # 清理后会再跑一遍冒烟测试，确认删除没有影响运行。
+      - name: 清理调试符号与无用文件
         run: |
           set -euo pipefail
-          OUT_DIR="out/${{ matrix.rid }}"
-          echo "清理前体积:"
-          du -sh "$OUT_DIR"
-
+          OUT_DIR="out/${RID}"
+          echo "清理前体积:"; du -sh "$OUT_DIR"
           echo "将要删除的文件："
-          find "$OUT_DIR" -type f \( \
-              -name "*.dbg" -o \
-              -name "*.pdb" -o \
-              -name "*.xml" -o \
-              -name "createdump" \
-            \) -print
+          find "$OUT_DIR" -type f \( -name "*.dbg" -o -name "*.pdb" -o -name "*.xml" -o -name "createdump" \) -print
+          find "$OUT_DIR" -type f \( -name "*.dbg" -o -name "*.pdb" -o -name "*.xml" -o -name "createdump" \) -delete
+          echo "清理后体积:"; du -sh "$OUT_DIR"
 
-          find "$OUT_DIR" -type f \( \
-              -name "*.dbg" -o \
-              -name "*.pdb" -o \
-              -name "*.xml" -o \
-              -name "createdump" \
-            \) -delete
+      # 公开分发二进制时，把上游的 License / 第三方声明一并放进压缩包
+      - name: 复制 License / 第三方声明
+        run: |
+          set -euo pipefail
+          FOUND=0
+          for f in LICENSE LICENSE.txt LICENSE.md NOTICE NOTICE.txt \
+                   THIRD-PARTY-NOTICES.txt THIRD-PARTY-NOTICES.md; do
+            if [ -f "ilspy-src/$f" ]; then
+              cp "ilspy-src/$f" "out/${RID}/"
+              echo "已复制 $f"
+              FOUND=1
+            fi
+          done
+          if [ "$FOUND" -eq 0 ]; then
+            echo "::warning::上游源码根目录没有找到 LICENSE / NOTICE 文件，请人工确认"
+          fi
 
-          echo "清理后体积:"
-          du -sh "$OUT_DIR"
+      # 冒烟测试：构建成功 != 能运行。
+      # 只有 linux-x64（runner 原生）和 linux-musl-x64（Alpine 容器）能在
+      # 当前 runner 上验证；arm64 与 win-x64 跨架构/跨平台无法在此执行，
+      # 属于已知验证缺口。
+      - name: 冒烟测试（linux-x64，原生运行）
+        if: matrix.rid == 'linux-x64'
+        run: |
+          set -euo pipefail
+          chmod +x "out/${RID}/ilspycmd"
+          "out/${RID}/ilspycmd" --version
+
+      - name: 冒烟测试（linux-musl-x64，Alpine 容器内运行）
+        if: matrix.rid == 'linux-musl-x64'
+        run: |
+          set -euo pipefail
+          chmod +x "out/${RID}/ilspycmd"
+          docker run --rm -v "$PWD/out/${RID}:/app:ro" alpine:3 /app/ilspycmd --version
 
       - name: 打包 zip
         run: |
           set -euo pipefail
           mkdir -p dist
-          VERSION="${{ needs.check-version.outputs.version }}"
-          cd "out/${{ matrix.rid }}"
-          zip -r -9 -q "../../dist/ilspycmd-${VERSION}-${{ matrix.rid }}.zip" .
+          cd "out/${RID}"
+          zip -r -9 -q "../../dist/ilspycmd-${VERSION}-${RID}.zip" .
           cd ../..
           ls -lh dist
 
       - name: 上传构建产物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ilspycmd-${{ matrix.rid }}
           path: dist/*.zip
-          retention-days: 3
+          retention-days: 14         # 保留久一点，方便发布失败后排查
           if-no-files-found: error
 
   # ---------------------------------------------------------------------
-  # 第 3 步：汇总所有产物，发布/更新到本仓库 Release
+  # 第 3 步：汇总所有产物，生成 SHA256SUMS，发布/更新到本仓库 Release
+  #   只有这个 job 拥有 contents: write，且不检出、不执行任何第三方源码。
   # ---------------------------------------------------------------------
   publish:
     needs: [check-version, build]
     if: needs.check-version.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - name: 下载所有构建产物
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
           pattern: ilspycmd-*
           merge-multiple: true
 
+      - name: 生成 SHA256SUMS
+        working-directory: artifacts
+        run: |
+          set -euo pipefail
+          sha256sum *.zip > SHA256SUMS
+          cat SHA256SUMS
+
       - name: 发布 GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ needs.check-version.outputs.version }}
           name: "ilspycmd ${{ needs.check-version.outputs.version }} (self-contained)"
@@ -305,12 +401,14 @@ jobs:
           body: |
             ## 简介 / Overview
 
-            自动构建自 [icsharpcode/ILSpy@${{ needs.check-version.outputs.version }}](${{ needs.check-version.outputs.release_url }}) 的 `ilspycmd` self-contained 版本。压缩包内已包含对应平台的 .NET 运行时，解压即可直接运行，**目标机器无需安装 .NET SDK/Runtime**。已移除调试符号（`*.pdb` / `*.dbg`）、`createdump` 及 API 文档注释（`*.xml`）等对最终用户无用的文件，仅保留运行所需内容。
+            自动构建自 [icsharpcode/ILSpy@${{ needs.check-version.outputs.version }}](${{ needs.check-version.outputs.release_url }})（commit `${{ needs.check-version.outputs.commit }}`）的 `ilspycmd` self-contained 版本。压缩包内已包含对应平台的 .NET 运行时，解压即可直接运行，**目标机器无需安装 .NET SDK/Runtime**。已移除调试符号（`*.pdb` / `*.dbg`）、`createdump` 及 API 文档注释（`*.xml`）等对最终用户无用的文件，仅保留运行所需内容。
 
-            Self-contained build of `ilspycmd`, automatically compiled from [icsharpcode/ILSpy@${{ needs.check-version.outputs.version }}](${{ needs.check-version.outputs.release_url }}). Each archive bundles its own .NET runtime — **no .NET SDK/Runtime installation is required** on the target machine. Debug symbols (`*.pdb` / `*.dbg`), the `createdump` crash-dump helper, and API doc-comment `*.xml` files have been stripped, leaving only what's needed to run.
+            Self-contained build of `ilspycmd`, automatically compiled from [icsharpcode/ILSpy@${{ needs.check-version.outputs.version }}](${{ needs.check-version.outputs.release_url }}) at commit `${{ needs.check-version.outputs.commit }}`. Each archive bundles its own .NET runtime — **no .NET SDK/Runtime installation is required** on the target machine. Debug symbols (`*.pdb` / `*.dbg`), the `createdump` crash-dump helper, and API doc-comment `*.xml` files have been stripped, leaving only what's needed to run.
 
             本 Release 由 GitHub Actions 定时自动生成，非 ILSpy 官方发布。
             This release is generated automatically on a schedule by GitHub Actions and is **not** an official ILSpy release.
+
+            构建记录 / Build run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
             ## 下载 / Downloads
 
@@ -321,4 +419,12 @@ jobs:
             | Linux x64 (musl，如 Alpine) | `ilspycmd-${{ needs.check-version.outputs.version }}-linux-musl-x64.zip` |
             | Linux arm64 (musl) | `ilspycmd-${{ needs.check-version.outputs.version }}-linux-musl-arm64.zip` |
             | Windows x64 | `ilspycmd-${{ needs.check-version.outputs.version }}-win-x64.zip` |
-          files: artifacts/*.zip
+
+            下载后请用 `SHA256SUMS` 核对文件完整性。
+            Please verify downloads against the checksums in `SHA256SUMS`.
+
+            > 说明 / Note：构建时仅 linux-x64 与 linux-musl-x64 做了实际运行验证；arm64 与 Windows 包为交叉编译产物，未在对应平台实机验证。
+            > Only linux-x64 and linux-musl-x64 were executed as smoke tests during the build; the arm64 and Windows packages are cross-compiled and were not run on their target platforms.
+          files: |
+            artifacts/*.zip
+            artifacts/SHA256SUMS

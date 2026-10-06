@@ -1,0 +1,9 @@
+# 让 Dependabot 每周检查 workflow 里引用的 GitHub Actions 是否有新版本，
+# 并自动提 PR。Action 已固定到 commit SHA，这样既保证引用不可变，
+# 又不需要手动去查新 SHA。
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

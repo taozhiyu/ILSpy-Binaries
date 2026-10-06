@@ -2,9 +2,9 @@
 
 Unofficial automated self-contained builds of [ILSpy](https://github.com/icsharpcode/ILSpy).
 
-[![Latest Release](https://img.shields.io/github/v/release/taozhiyu/ILSpy-Binaries?display_name=tag&sort=semver)](../../releases/latest)
-[![Build Status](https://img.shields.io/github/actions/workflow/status/taozhiyu/ILSpy-Binaries/build-ilspycmd.yml?branch=main&label=build)](../../actions/workflows/build-ilspycmd.yml)
-[![License](https://img.shields.io/github/license/taozhiyu/ILSpy-Binaries?label=license)](../../blob/main/LICENSE)
+[![Latest Release](https://img.shields.io/github/v/release/taozhiyu/ILSpy-Binaries?display_name=tag&sort=semver)](https://github.com/taozhiyu/ILSpy-Binaries/releases/latest)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/taozhiyu/ILSpy-Binaries/build-ilspycmd.yml?branch=main&label=build)](https://github.com/taozhiyu/ILSpy-Binaries/actions/workflows/build-ilspycmd.yml)
+[![License](https://img.shields.io/github/license/taozhiyu/ILSpy-Binaries?label=license)](https://github.com/taozhiyu/ILSpy-Binaries/blob/main/LICENSE)
 
 [简体中文](README.zh.md) | English
 
@@ -43,7 +43,7 @@ In particular, the `linux-musl-*` builds use the .NET musl runtime identifiers a
 
 ## Downloads
 
-Open the [Releases](../../releases) page to download a specific version.
+Open the [Releases](https://github.com/taozhiyu/ILSpy-Binaries/releases) page to download a specific version.
 
 For the latest release, stable asset URLs are also available:
 

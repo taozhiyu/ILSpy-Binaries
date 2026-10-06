@@ -2,9 +2,9 @@
 
 [ILSpy](https://github.com/icsharpcode/ILSpy) 的非官方自动化、自包含二进制构建项目。
 
-[![最新版本](https://img.shields.io/github/v/release/taozhiyu/ILSpy-Binaries?display_name=tag&sort=semver)](../../releases/latest)
-[![构建状态](https://img.shields.io/github/actions/workflow/status/taozhiyu/ILSpy-Binaries/build-ilspycmd.yml?branch=main&label=build)](../../actions/workflows/build-ilspycmd.yml)
-[![许可证](https://img.shields.io/github/license/taozhiyu/ILSpy-Binaries?label=license)](../../blob/main/LICENSE)
+[![最新版本](https://img.shields.io/github/v/release/taozhiyu/ILSpy-Binaries?display_name=tag&sort=semver)](https://github.com/taozhiyu/ILSpy-Binaries/releases/latest)
+[![构建状态](https://img.shields.io/github/actions/workflow/status/taozhiyu/ILSpy-Binaries/build-ilspycmd.yml?branch=main&label=build)](https://github.com/taozhiyu/ILSpy-Binaries/actions/workflows/build-ilspycmd.yml)
+[![许可证](https://img.shields.io/github/license/taozhiyu/ILSpy-Binaries?label=license)](https://github.com/taozhiyu/ILSpy-Binaries/blob/main/LICENSE)
 
 English | [简体中文](README.zh.md)
 
@@ -55,7 +55,7 @@ linux-musl-arm64
 
 ## 下载
 
-可以进入 [Releases](../../releases) 页面下载指定版本。
+可以进入 [Releases](https://github.com/taozhiyu/ILSpy-Binaries/releases) 页面下载指定版本。
 
 最新版本还可以通过以下固定地址下载：
 

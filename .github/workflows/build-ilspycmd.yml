@@ -331,6 +331,40 @@ jobs:
           echo "找到项目文件: $MATCHES"
           echo "CSPROJ=$MATCHES" >> "$GITHUB_ENV"
 
+      # ================================================================
+      # 还原前置：预热 NuGet 全局包目录
+      #
+      # 根因（11 组受控实验 + 真实 CI 日志，见 Restore 步骤上方注释）：
+      #   ICSharpCode.Decompiler.Generators 的还原在 job **冷启动瞬间**
+      #   会与 NuGet 全局包目录（~/.nuget/packages）的首次初始化发生
+      #   时序竞争，导致它在 0.3~72ms 内静默失败（MSB4181，无 NU 错误码）。
+      #
+      #   决定性证据：diag11 在同一个 job 内连续跑 20 次（每次都清空
+      #   obj/ 与 http 缓存）-> 20/20 全部 PASS；不清理再跑 10 次 ->
+      #   10/10 全 PASS。而 build job 每次都是全新冷启动 -> 必挂。
+      #   同一 job 内循环永不失败，说明命令本身没问题，
+      #   问题出在“第一次执行”这个时机。
+      #
+      # 因此在正式还原前先跑一次同参数还原做预热：把全局包目录、
+      # http 缓存、临时目录全部初始化好，让正式还原不再面对冷启动竞争。
+      # 预热失败不致命（continue-on-error），后面还有 6 次重试兜底。
+      # ================================================================
+      - name: 预热 NuGet 缓存（消除冷启动竞争）
+        working-directory: ilspy-src
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          echo "预热前全局包目录:"
+          dotnet nuget locals global-packages --list 2>&1 || true
+
+          # 与正式还原同参数跑一次，把包全部下载/解包到位
+          dotnet restore "$CSPROJ" \
+            -r "$RID" \
+            -p:RestoreLockedMode=false \
+            -p:RestoreEnablePackagePruning=false 2>&1 | tail -8 || true
+
+          echo "预热完成（无论成败，正式还原步骤会再执行一次并带重试）"
+
       # 单次还原。刻意不做“先试 locked 模式再回退”的两段式：
       # 上游 csproj 硬编码了 <RestoreLockedMode>true</RestoreLockedMode>，
       # 而 lock 文件的 RID 段固定为 win-x64;win-arm64;linux-x64;osx-arm64，

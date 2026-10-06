@@ -357,12 +357,22 @@ jobs:
       # 不去跑那条注定失败、且会污染 obj/ 中间状态的试探分支。
       #
       # -p:RestoreEnablePackagePruning=false 与上游官方构建脚本一致。
+      #
+      # 重试为什么必须彻底清理（这一点是从失败日志里读出来的关键）：
+      # 第一次尝试时其余 4 个项目耗时 5~7s并Restored 成功，
+      # 而 Generators 只用了 43ms 就失败；随后几次尝试里它变成
+      # 0.4~4ms 瞬间失败——说明第一次失败已经写入了半成品
+      # project.assets.json / project.nuget.cache，后续重试会直接
+      # 命中这份坏状态，根本不会重新解析。因此每次重试前必须：
+      #   1) 删掉所有 obj/（含 assets / nuget.cache / nuget.g.props）
+      #   2) 清掉 NuGet 的 http 缓存（vulnerability 数据库等）
+      #   3) 清掉已解包到~/.nuget/packages 的本项目包，避免复用坏状态
       - name: Restore（失败自动重试）
         working-directory: ilspy-src
         run: |
           set -uo pipefail
 
-          MAX_ATTEMPTS=5
+          MAX_ATTEMPTS=6
           ATTEMPT=1
 
           while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
@@ -376,17 +386,23 @@ jobs:
               exit 0
             fi
 
-            echo "::warning::第 $ATTEMPT 次还原失败（多为 Generators 的 MSB4181 偶发故障）"
+            echo "::warning::第 $ATTEMPT 次还原失败（Generators 的 MSB4181 偶发故障）"
 
             if [ "$ATTEMPT" -eq "$MAX_ATTEMPTS" ]; then
               echo "::error::还原重试 $MAX_ATTEMPTS 次仍失败"
+              echo "::group::最后一次失败的相关项目状态"
+              find . -type d -name obj -prune -exec ls -la {} + 2>/dev/null | head -40 || true
+              echo "::endgroup::"
               exit 1
             fi
 
-            # 清掉半成品中间状态与本地包缓存后重试
+            # 彻底清理：obj/ + NuGet http 缓存 + 全局包缓存
             find . -type d -name obj -prune -exec rm -rf {} + 2>/dev/null || true
+            dotnet nuget locals http-cache --clear 2>/dev/null || true
+            dotnet nuget locals global-packages --clear 2>/dev/null || true
+
             ATTEMPT=$((ATTEMPT + 1))
-            sleep $((ATTEMPT * 3))
+            sleep $((ATTEMPT * 5))
           done
 
           exit 1

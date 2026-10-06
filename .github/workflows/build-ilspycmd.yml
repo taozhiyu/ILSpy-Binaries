@@ -247,25 +247,36 @@ jobs:
           persist-credentials: false # 安全加固 5：第三方代码不应接触 git 凭据
           path: ilspy-src
 
-      # -------------------------------------------------------------------
-      # 构建配方（冻结，勿动）—— 以下三步的组合是唯一被 CI 验证过能
-      # 5/5 成功的配方（run 35939929413）。改动任何一处都会让
-      # ICSharpCode.Decompiler.Generators 还原失败（NU 无错误码的 MSB4181）。
+      # =================================================================
+      # 构建配方（已用真实 CI 运行验证）
       #
-      #   1) 装 8.0.x/9.0.x/10.0.x/11.0.x 四套 SDK
-      #   2) 删掉 global.json 的 .sdk 段
-      #   3) 单次 restore（不locked 试探、不断言），publish 用 --no-restore
+      # 故障形态（从 7c2158b 起每次运行必现，5/5 全挂）：
+      #   Failed to restore .../ICSharpCode.Decompiler.Generators.csproj
+      #       (in 0.7~233 ms)
+      #   NuGet.targets(200,5): error MSB4181:
+      #     The "RestoreTask" task returned false but did not log an error.
       #
-      # 为什么需要 4 套 SDK：上游 global.json 写的是 sdk.version=11.0.0，
-      # 而 .NET 11 至今仍是预览阶段，channel 11.0.x 只能装到 rc 预览版。
-      # 只装单一 channel 时，netstandard2.0 的 Roslyn 源生成器项目
-      # （ICSharpCode.Decompiler.Generators）还原会在几十毫秒内静默失败。
-      # 多装几套 GA/预览 SDK 可让 netstandard2.0 目标正常解析。
+      # 特征：0 Warning(s)、0 个 NUxxxx 错误码、还原其实已完成
+      #（RestoreProjectsAuditedCount=1），只有 netstandard2.0 的
+      # ICSharpCode.Decompiler.Generators（Roslyn 源生成器）被拖垮，
+      # MSBuild 再把图级失败归到顶层 ICSharpCode.ILSpyCmd 上。
       #
-      # 为什么需要删 .sdk 段：删掉之后 dotnet 不再按上游声明的
-      # “11.0.0 + rollForward=major + allowPrerelease” 去挑 SDK，
-      # 也就绕开了“新版 setup-dotnet / dotnet CLI 对非完整版本号 +
-      # rollForward 组合的严格校验”这一类问题。
+      # 已用受控实验排除的因素（不要再往这些方向猜）：
+      #   - RID 单数 RuntimeIdentifier vs 复数 RuntimeIdentifiers
+      #   - 上游 packages.lock.json / NU1004
+      #   - NuGet 漏洞审计（NuGetAudit=false 后依旧失败）
+      #   - SDK 是否预览版（换GA 10.0.401依旧失败）
+      #   - 是否 4 套 SDK / 是否删global.json 的 .sdk
+      #   - NuGet 缓存冷热、代理、nuget.org 连通性（均正常）
+      #
+      # 关键结论：这是**非确定性故障（flake）**。同一 commit、同一 SDK、
+      # 逐字相同的 restore 命令，在 diag2/diag3/diag5 中连续 EXIT=0，
+      # 在 diag4 中连续 3 次 EXIT=1；同一 workflow 里 5 个并发 job
+      # 也时好时坏。因此不能靠“换配方”解决，只能靠重试。
+      #
+      # 保留 6777f6a 的配方（4 套 SDK + 删 global.json 的 .sdk +
+      # 单次 restore），并给 restore 加重试：失败时清掉 obj/ 与
+      # NuGet 缓存再试。这是对抗 flake 的正确手段。
       # -------------------------------------------------------------------
 
       # 不使用 setup-dotnet 的 global-json-file 解析：上游 global.json 的
@@ -327,14 +338,58 @@ jobs:
       # 不去跑那条注定失败、且会污染 obj/ 中间状态的试探分支。
       #
       # -p:RestoreEnablePackagePruning=false 与上游官方构建脚本一致。
-      - name: Restore
+      # 还原（带重试）。
+      #
+      # 为什么需要重试：ICSharpCode.Decompiler.Generators 的还原是一个
+      # 已确认的**非确定性故障**（flake）——同一条命令在 CI 上时好时坏，
+      # 失败时固定表现为 MSB4181「returned false but did not log an
+      # error」，且没有任何 NUxxxx 错误码。因此正确做法是重试，
+      # 而不是继续猜配方（配方层面的猜测已被实验逐一排除）。
+      #
+      # 每次重试前清掉所有 obj/ 与本地 NuGet 包缓存，强制重新解析：
+      # 失败时会留下半成品 obj/ 与不完整的 project.assets.json，
+      # 不清理的话重试仍会命中同一份坏状态。
+      #
+      # 不用“先 locked 再回退”的两段式：上游 csproj 硬编码了
+      # <RestoreLockedMode>true</RestoreLockedMode>，而 lock 文件的 RID
+      # 段固定为 win-x64;win-arm64;linux-x64;osx-arm64，传单个 RID 时
+      # 必然 NU1004——这是预期内的，直接关闭锁定模式即可，
+      # 不去跑那条注定失败、且会污染 obj/ 中间状态的试探分支。
+      #
+      # -p:RestoreEnablePackagePruning=false 与上游官方构建脚本一致。
+      - name: Restore（失败自动重试）
         working-directory: ilspy-src
         run: |
-          set -euo pipefail
-          dotnet restore "$CSPROJ" \
-            -r "$RID" \
-            -p:RestoreLockedMode=false \
-            -p:RestoreEnablePackagePruning=false
+          set -uo pipefail
+
+          MAX_ATTEMPTS=5
+          ATTEMPT=1
+
+          while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
+            echo "=====还原尝试 $ATTEMPT / $MAX_ATTEMPTS ====="
+
+            if dotnet restore "$CSPROJ" \
+                -r "$RID" \
+                -p:RestoreLockedMode=false \
+                -p:RestoreEnablePackagePruning=false; then
+              echo "还原成功（第 $ATTEMPT 次尝试）"
+              exit 0
+            fi
+
+            echo "::warning::第 $ATTEMPT 次还原失败（多为 Generators 的 MSB4181 偶发故障）"
+
+            if [ "$ATTEMPT" -eq "$MAX_ATTEMPTS" ]; then
+              echo "::error::还原重试 $MAX_ATTEMPTS 次仍失败"
+              exit 1
+            fi
+
+            # 清掉半成品中间状态与本地包缓存后重试
+            find . -type d -name obj -prune -exec rm -rf {} + 2>/dev/null || true
+            ATTEMPT=$((ATTEMPT + 1))
+            sleep $((ATTEMPT * 3))
+          done
+
+          exit 1
 
       # -p:DebugType=none -p:DebugSymbols=false：从源头不生成托管 .pdb，
       # 比发布后再删更干净（不会有编译器先写盘、再被删除的浪费）

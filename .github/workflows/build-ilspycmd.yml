@@ -487,6 +487,77 @@ jobs:
             echo "::warning::上游源码根目录没找到 LICENSE / NOTICE 文件，请人工确认"
           fi
 
+      # ---------------------------------------------------------------------
+      # musl（Alpine）包补齐 GCC 运行库依赖
+      #
+      # 背景：ilspycmd 的 ELF 里有两条 NEEDED 依赖：
+      #   NEEDED  libstdc++.so.6
+      #   NEEDED  libgcc_s.so.1
+      # self-contained 只打包 .NET 运行时，不含这两个 GCC 运行库。
+      # 纯净 Alpine 默认也不带它们，于是用户解压后直接运行会报
+      #   Error loading shared library libstdc++.so.6
+      #
+      # 实测结论（diag14/diag15，纯 Alpine 容器内验证）：
+      #   P1 纯净 Alpine 直接运行                -> 失败
+      #   P2 把库放进同目录，不设LD_LIBRARY_PATH -> 仍然失败
+      #      （musl loader 只按 ld-musl-*.path + 默认目录搜索，
+      #        不会搜索程序所在目录）
+      #   P3 同目录 + LD_LIBRARY_PATH            -> 成功
+      #   W1 给所有依赖方注入 RPATH='$ORIGIN'     -> 成功，且用户
+      #      解压后可直接 ./ilspycmd，无需任何环境变量
+      #
+      # 因此采用 RPATH 方案：把 libstdc++/libgcc_s 随包分发，
+      # 并给主程序及所有依赖它们的 .so 注入 RPATH=$ORIGIN。
+      #
+      # 体积代价：libstdc++.so.6.0.34约 2.7MB + libgcc_s.so.1 约 170KB
+      # 许可：GCC Runtime Library Exception（随 GCC 分发，允许再分发）
+      # ---------------------------------------------------------------------
+      - name: 随包分发 GCC 运行库（仅 musl）
+        if: startsWith(matrix.rid, 'linux-musl-')
+        run: |
+          set -euo pipefail
+
+          OUT_DIR="out/${RID}"
+
+          # 从 Alpine 官方仓库取出库文件与许可证
+          docker run --rm -v "$PWD/${OUT_DIR}:/app" alpine:3 /bin/sh -c '
+            set -e
+            apk add --no-cache libstdc++ libgcc >/dev/null
+            # 真实文件 + SONAME 软链，缺一不可
+            cp -L /usr/lib/libstdc++.so.6 /app/libstdc++.so.6
+            cp -L /usr/lib/libgcc_s.so.1  /app/libgcc_s.so.1
+            # 记录版本，便于排查与许可追溯
+            apk list -I libstdc++ libgcc > /app/GCC-RUNTIME-LIBRARIES.txt
+            # 许可证全文（GPL-2.0-or-later AND LGPL-2.1-or-later
+            # + GCC Runtime Library Exception）
+            for d in /usr/share/licenses/gcc /usr/share/licenses/libstdc++ /usr/share/licenses/libgcc; do
+              [ -d "$d" ] && cp -r "$d" /app/ 2>/dev/null || true
+            done
+            apk info -L libstdc++ 2>/dev/null | grep -i licen || true
+          '
+
+          # 注入 RPATH，让 loader 能找到同目录的库。
+          # 必须对所有依赖方都注入：实测 libcoreclr.so、libhostfxr.so、
+          # libhostpolicy.so、libclrgc.so、libclrjit.so 等 9 个 .so
+          # 都有 NEEDED libstdc++/libgcc_s。
+          sudo apt-get update -qq && sudo apt-get install -y -qq patchelf >/dev/null
+
+          RPATH_PATCHED=0
+          for f in "${OUT_DIR}/ilspycmd" "${OUT_DIR}"/*.so; do
+            [ -f "$f" ] || continue
+            if readelf -d "$f" 2>/dev/null | grep -qE "NEEDED.*(libstdc\+\+|libgcc_s)"; then
+              patchelf --set-rpath '$ORIGIN' "$f"
+              RPATH_PATCHED=$((RPATH_PATCHED + 1))
+            fi
+          done
+          echo "已为 $RPATH_PATCHED 个文件注入 RPATH=\$ORIGIN"
+
+          # 校验：确认库和 RPATH 都在，且清单已生成
+          test -f "${OUT_DIR}/libstdc++.so.6" || { echo "::error::libstdc++.so.6 缺失"; exit 1; }
+          test -f "${OUT_DIR}/libgcc_s.so.1"  || { echo "::error::libgcc_s.so.1 缺失"; exit 1; }
+          cat "${OUT_DIR}/GCC-RUNTIME-LIBRARIES.txt"
+          ls -lh "${OUT_DIR}"/libstdc++.so.6 "${OUT_DIR}"/libgcc_s.so.1
+
       # 冒烟测试：构建成功 != 能运行。
       # 只有 linux-x64（runner 原生）和 linux-musl-x64（Alpine 容器）能在
       # 当前 runner 上验证；arm64 与 win-x64 跨架构/跨平台无法在此执行，
@@ -498,17 +569,16 @@ jobs:
           chmod +x "out/${RID}/ilspycmd"
           "out/${RID}/ilspycmd" --version
 
-      - name: 冒烟测试（linux-musl-x64，Alpine 容器内运行）
-        if: matrix.rid == 'linux-musl-x64'
+      # 关键：这里刻意用「纯净 alpine」且不设任何 LD_LIBRARY_PATH，
+      # 因为发行包必须做到解压即用。若这里 apk add 了 libstdc++，
+      # 就等于掩盖了 RPATH 没生效的问题。
+      - name: 冒烟测试（linux-musl，纯净 Alpine 解压即用验证）
+        if: startsWith(matrix.rid, 'linux-musl-')
         run: |
           set -euo pipefail
           chmod +x "out/${RID}/ilspycmd"
-          # 纯 Alpine 默认不装 libstdc++ / libgcc_s，而 self-contained 的
-          # ilspycmd 依赖它们，直接 alpine:3 会报
-          #   Error loading shared library libstdc++.so.6
-          # 因此用已预装这两个库的 alpine 镜像变体来验证。
           docker run --rm -v "$PWD/out/${RID}:/app:ro" \
-            alpine:3 /bin/sh -c "apk add --no-cache libstdc++ libgcc >/dev/null && /app/ilspycmd --version"
+            alpine:3 /bin/sh -c 'cd /app && ./ilspycmd --version'
 
       - name: 打包 zip
         run: |
@@ -583,8 +653,11 @@ jobs:
             下载后请用 `SHA256SUMS` 核对文件完整性。
             Please verify downloads against the checksums in `SHA256SUMS`.
 
-            > 说明 / Note：构建时仅 linux-x64 与 linux-musl-x64 做了实际运行验证；arm64 与 Windows 包为交叉编译产物，未在对应平台实机验证。
-            > Only linux-x64 and linux-musl-x64 were executed as smoke tests during the build; the arm64 and Windows packages are cross-compiled and were not run on their target platforms.
+            > 说明 / Note：构建时 linux-x64 原生运行验证；两个 musl 包在**纯净 Alpine 容器**中验证「解压即用」（无需 `apk add`、无需设置 `LD_LIBRARY_PATH`）；arm64 与 Windows 包为交叉编译产物，未在对应平台实机验证。
+            > Only linux-x64 was executed as a smoke test on the runner; the two musl packages were verified **in a clean Alpine container** to run straight after extraction (no `apk add`, no `LD_LIBRARY_PATH`); the arm64 and Windows packages are cross-compiled and were not run on their target platforms.
+
+            > musl 包说明 / musl packages：`ilspycmd` 的 ELF 依赖 `libstdc++.so.6` 与 `libgcc_s.so.1`（self-contained 只打包 .NET 运行时，不含 GCC 运行库）。为实现解压即用，`linux-musl-*` 包内已随附这两个库，并为所有相关二进制注入了 `RPATH=$ORIGIN`。它们来自 Alpine 官方仓库的 `libstdc++` / `libgcc` 包，按 **GCC Runtime Library Exception** 许可分发，许可证全文见包内 `GCC-RUNTIME-LIBRARIES.txt` 及 `licenses/` 目录。若你的系统已提供这两个库，可安全删除包内副本。
+            > The `linux-musl-*` archives ship `libstdc++.so.6` and `libgcc_s.so.1` with `RPATH=$ORIGIN` baked in, so they run immediately after extraction with no extra packages. They come from Alpine's `libstdc++` / `libgcc` packages under the **GCC Runtime Library Exception**; see `GCC-RUNTIME-LIBRARIES.txt` and `licenses/` in the archive. If your system already provides them, deleting the bundled copies is safe.
           files: |
             artifacts/*.zip
             artifacts/SHA256SUMS

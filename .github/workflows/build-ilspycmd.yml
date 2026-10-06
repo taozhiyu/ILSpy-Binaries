@@ -12,14 +12,49 @@ name: Build & Release ilspycmd (self-contained)
 # package for the 5 platforms above and publishes them to this repo's
 # Releases.
 #
-# 安全设计要点（本 workflow 会自动编译并执行第三方源码，按"供应链系统"对待）：
-#   1. 权限最小化：默认只读，只有 publish job 才有 contents: write
-#   2. build job 检出第三方源码时不保留 git 凭据（persist-credentials: false）
-#   3. 所有第三方 Action 固定到完整 commit SHA（由 Dependabot 自动提 PR 升级）
-#   4. 检测阶段把 tag 解析成 commit SHA，构建阶段直接按 SHA 检出，
-#      避免"检测时和构建时 tag 指向不同 commit"
-#   5. run 脚本里不直接插值 ${{ }}，统一走环境变量，避免脚本注入
-#   6. 发布 SHA256SUMS，并对可原生运行的平台做冒烟测试
+# ---------------------------------------------------------------------------
+# 构建配方说明（重要，改动前请先读完）
+#
+# 本仓库只做一件事：把上游第三方源码编译成二进制。因此“构建配方”必须
+# 严格限定在“已被 CI 实际验证过”的那条路径上，不要根据推理去优化它。
+#
+# 已知事实（全部来自 GitHub Actions 真实运行日志，不是推断）：
+#
+#   * run 35939929413（commit 6777f6a）= 唯一一次 5 个 RID 全部构建成功。
+#     它的配方是：
+#       - setup-dotnet 安装 8.0.x / 9.0.x / 10.0.x / 11.0.x 四套 SDK
+#       - 删除 global.json 里的 .sdk 段（保留 test 等其它段）
+#       - 单次 dotnet restore（-r <rid>，RestoreLockedMode=false）
+#       - dotnet publish --no-restore
+#
+#   * 从 7c2158b 起，配方被“改进”为：只装global.json 推导出的那一个
+#     SDK channel、不再删除 global.json 的 .sdk、restore 先尝试 locked
+#     模式再回退。此后每一次 CI 运行都是 5/5 失败。
+#     失败形态固定为：
+#       Failed to restore .../ICSharpCode.Decompiler.Generators.csproj (in 1~233 ms).
+#       .../NuGet.targets(198,5): error MSB4181:
+#         The "RestoreTask" task returned false but did not log an error.
+#     关键细节：0 Warning(s)、0 个 NUxxxx 错误码、还原其实已完成
+#     （RestoreProjectsAuditedCount=1），只有 netstandard2.0 的
+#     ICSharpCode.Decompiler.Generators（Roslyn 源生成器）被拖垮，
+#     MSBuild 把图级失败归到了顶层 ICSharpCode.ILSpyCmd 上。
+#
+#   * 已排除的因素（都实测/查证过，不要再往这些方向猜）：
+#       - RID 单数 RuntimeIdentifier vs 复数 RuntimeIdentifiers
+#       - 上游 packages.lock.json 与 NU1004（locked 模式失败是预期的，
+#         原本就有回退分支，不是本次故障原因）
+#       - NuGet 漏洞审计（NuGetAudit=false 之后 CI 依旧失败）
+#       - SDK 是否为预览版（换到GA 10.0.401 依旧失败）
+#       - 缓存冷热（冷缓存下本地也能通过）
+#
+#   => 结论：唯一被证实与成败相关的变量是“装哪几套 SDK + global.json
+#      是否被改写”。本workflow 回到 6777f6a 的配方，并只在其上叠加
+#      不触碰构建语义的安全加固（权限分层、SHA 固定、并发锁、
+#      commit SHA 检出、脚本注入防护、checksum）。
+#
+#      换言之：安全加固保留，构建配方冻结。任何试图“顺手优化”SDK /
+#      global.json / restore 分段的改动，都会重新踩进已知故障。
+# ---------------------------------------------------------------------------
 
 on:
   schedule:
@@ -36,19 +71,27 @@ on:
         type: boolean
         default: false
 
-# 全局默认只读；需要写权限的 job（publish）单独声明
+# ===========================================================================
+# 安全加固 1：权限最小化
+#   全局只读；只有 publish job 显式声明 contents: write。
+#   build job 会执行第三方源码（MSBuild / NuGet / 源生成器），
+#   它绝不能持有写权限。
+# ===========================================================================
 permissions:
   contents: read
 
-# 同一时间只允许一个发布流程运行，防止"定时任务 + 手动触发"并发改同一个 Release。
-# cancel-in-progress 必须是 false：发布到一半被取消会留下半成品。
+# ===========================================================================
+# 安全加固 2：并发锁
+#   防止“每日定时”与“手动触发”同时操作同一个 Release。
+#   cancel-in-progress 必须为 false：发布到一半被取消会留下半成品。
+# ===========================================================================
 concurrency:
   group: ilspycmd-release
   cancel-in-progress: false
 
 env:
   UPSTREAM_REPO: icsharpcode/ILSpy
-  # 5 个平台包的 RID 列表，用于校验已发布 Release 的资产是否齐全
+  # 5 个平台包的 RID 列表，check-version / build / publish 共用同一份定义
   RID_LIST: "linux-arm64 linux-musl-arm64 linux-musl-x64 linux-x64 win-x64"
 
 jobs:
@@ -76,8 +119,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 统一的 API 调用封装：HTTP 错误直接失败（-f），网络抖动自动重试，
-          # 避免 403/429/5xx 被悄悄吞掉，后面才冒出难懂的 "null" 错误
+          # API 调用统一封装：HTTP 错误直接失败（-f）、网络抖动自动重试，
+          # 避免 403/429/5xx 被吞掉后只留下难懂的 "null"
           gh_api() {
             curl -fsS --retry 3 --retry-all-errors \
               --connect-timeout 10 --max-time 60 \
@@ -86,16 +129,15 @@ jobs:
               "$1"
           }
 
-          # ---- A. 确定要构建的 tag ----
+          # ---- A.确定要构建的 tag ----
           if [ -n "${FORCE_VERSION:-}" ]; then
-            # 手动输入的版本号先做格式校验，只允许常见 tag 字符
+            # 手动输入先做白名单校验，杜绝把脚本内容带进下游
             if ! printf '%s' "$FORCE_VERSION" | grep -Eq '^[A-Za-z0-9._+-]+$'; then
               echo "force_version 含有非法字符: $FORCE_VERSION" >&2
               exit 1
             fi
             TAG="$FORCE_VERSION"
             echo "手动指定版本: $TAG"
-            # 手动指定时也去上游查这个 tag 真实的 prerelease 状态，不写死 false
             RELEASE_JSON=$(gh_api "https://api.github.com/repos/${UPSTREAM_REPO}/releases/tags/${TAG}")
           else
             if [ "${INCLUDE_PRE:-false}" = "true" ]; then
@@ -119,7 +161,8 @@ jobs:
           fi
 
           # ---- B. tag -> commit SHA ----
-          # 后续构建直接按 commit SHA 检出，保证"检测的"和"构建的"是同一份源码
+          # 安全加固 3：消除 tag -> commit 的 TOCTOU。
+          # build阶段按 SHA 检出，保证“检测到的”和“构建的”是同一份源码。
           REF_JSON=$(gh_api "https://api.github.com/repos/${UPSTREAM_REPO}/git/refs/tags/${TAG}")
           OBJ_TYPE=$(echo "$REF_JSON" | jq -r '.object.type // empty')
           OBJ_SHA=$(echo "$REF_JSON" | jq -r '.object.sha // empty')
@@ -137,8 +180,7 @@ jobs:
           echo "tag ${TAG} -> commit ${COMMIT_SHA}"
 
           # ---- C. 校验本仓库该版本的 5 个资产是否齐全 ----
-          # 不只判断 Release 是否存在：某次构建部分失败后，Release 可能缺文件，
-          # 只判断存在性会导致永久跳过
+          # 只判断 Release 存在是不够的：某次构建部分失败后会永久跳过
           SHOULD_BUILD=true
           if gh release view "$TAG" --repo "$GH_REPO" --json assets \
               > /tmp/existing-release.json 2>/dev/null; then
@@ -169,12 +211,10 @@ jobs:
 
   # ---------------------------------------------------------------------
   # 第 2 步：按 5 个 RID 并行构建 self-contained 包
-  #   这个 job 会执行第三方源码（MSBuild / NuGet），所以只给只读权限，
-  #   且检出时不保留 git 凭据。
-  #   dotnet publish --self-contained 本身是跨平台发布，全部放在 Linux
+  #   dotnet publish --self-contained 本身是跨平台发布，全部放在Linux
   #   runner 上即可，不需要 Windows / ARM 机器。
   #   任意一个 RID 失败 -> build job 整体失败 -> publish 不会运行，
-  #   天然实现"5 个全部成功才发布"。
+  #   天然实现“5 个全部成功才发布”。
   # ---------------------------------------------------------------------
   build:
     needs: check-version
@@ -191,7 +231,7 @@ jobs:
           - linux-musl-x64
           - linux-x64
           - win-x64
-    # 统一通过环境变量传递，脚本里一律用 $VERSION / $COMMIT / $RID，
+    # 安全加固 4：统一通过环境变量传递，脚本里一律用 $VERSION/$RID，
     # 不在 run 脚本里直接写 ${{ }}（防脚本注入）
     env:
       VERSION: ${{ needs.check-version.outputs.version }}
@@ -204,59 +244,68 @@ jobs:
           repository: icsharpcode/ILSpy
           ref: ${{ needs.check-version.outputs.commit }}
           submodules: false          # 构建 ilspycmd 用不到 ILSpy-Tests 子模块
-          persist-credentials: false # 第三方代码不应接触 git 凭据
+          persist-credentials: false # 安全加固 5：第三方代码不应接触 git 凭据
           path: ilspy-src
 
-      # 不使用 setup-dotnet 的 global-json-file：上游 global.json 的
-      # sdk.version 写的是 "11.0.0"，setup-dotnet 较新版本对
-      # "非完整版本号 + rollForward" 的组合会直接报错。
-      # ILSpy 官方 CI 本身也没有用 global-json-file，而是直接写死
-      # dotnet-version + dotnet-quality: preview。
-      # 这里的做法：不修改 global.json，只从中读出 major.minor 换算成
-      # channel（如 11.0.0 -> 11.0.x），再显式安装——既适配上游，又不硬编码。
-      - name: 解析上游要求的 SDK channel
-        id: sdkver
-        run: |
-          set -euo pipefail
-          RAW=$(jq -r '.sdk.version // empty' ilspy-src/global.json 2>/dev/null || true)
-          if [ -z "$RAW" ]; then
-            echo "global.json 未指定 sdk.version，退回安装 latest"
-            echo "channel=latest" >> "$GITHUB_OUTPUT"
-          else
-            CHANNEL="$(echo "$RAW" | cut -d. -f1-2).x"
-            echo "global.json 指定 sdk.version=${RAW}，换算为 channel=${CHANNEL}"
-            echo "channel=${CHANNEL}" >> "$GITHUB_OUTPUT"
-          fi
+      # -------------------------------------------------------------------
+      # 构建配方（冻结，勿动）—— 以下三步的组合是唯一被 CI 验证过能
+      # 5/5 成功的配方（run 35939929413）。改动任何一处都会让
+      # ICSharpCode.Decompiler.Generators 还原失败（NU 无错误码的 MSB4181）。
+      #
+      #   1) 装 8.0.x/9.0.x/10.0.x/11.0.x 四套 SDK
+      #   2) 删掉 global.json 的 .sdk 段
+      #   3) 单次 restore（不locked 试探、不断言），publish 用 --no-restore
+      #
+      # 为什么需要 4 套 SDK：上游 global.json 写的是 sdk.version=11.0.0，
+      # 而 .NET 11 至今仍是预览阶段，channel 11.0.x 只能装到 rc 预览版。
+      # 只装单一 channel 时，netstandard2.0 的 Roslyn 源生成器项目
+      # （ICSharpCode.Decompiler.Generators）还原会在几十毫秒内静默失败。
+      # 多装几套 GA/预览 SDK 可让 netstandard2.0 目标正常解析。
+      #
+      # 为什么需要删 .sdk 段：删掉之后 dotnet 不再按上游声明的
+      # “11.0.0 + rollForward=major + allowPrerelease” 去挑 SDK，
+      # 也就绕开了“新版 setup-dotnet / dotnet CLI 对非完整版本号 +
+      # rollForward 组合的严格校验”这一类问题。
+      # -------------------------------------------------------------------
 
-      - name: 安装 .NET SDK
-        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6
-        with:
-          dotnet-version: ${{ steps.sdkver.outputs.channel }}
-          # 该 channel 若已 GA，仍会装到最新正式版；
-          # 若仍是 preview（如 11.0.x），需要这个开关才能装上
-          dotnet-quality: 'preview'
-
-      # 诊断：打印实际生效的 SDK 解析结果（global.json 解析失败会在这里直接暴露）
-      - name: 诊断：dotnet --info
+      # 不使用 setup-dotnet 的 global-json-file 解析：上游 global.json 的
+      # sdk.version 写作 "11.0.0"（非完整版本号）且带 rollForward，
+      # setup-dotnet 与 dotnet CLI 的严格校验会直接报错。
+      - name: 清理 global.json 里的 SDK 版本锁定
         working-directory: ilspy-src
         run: |
           set -euo pipefail
-          dotnet --info
+          if [ -f global.json ]; then
+            echo "补丁前:"
+            cat global.json
+            # 只删 .sdk，保留 msbuild-sdks / test 等其它段
+            jq 'del(.sdk)' global.json > global.json.tmp && mv global.json.tmp global.json
+            echo "补丁后:"
+            cat global.json
+          else
+            echo "未找到 global.json，跳过"
+          fi
 
-      # 如果后续 restore/publish 阶段 dotnet CLI 自己也因 global.json 报
-      # "compatible SDK not found"，再启用下面这个兜底（删除 sdk 锁定段，
-      # 保留 msbuild-sdks 等其它内容）。目前按官方 CI 的做法判断不需要。
-      # - name: 兜底：清除 global.json 的 sdk 锁定段
-      #   working-directory: ilspy-src
-      #   run: jq 'del(.sdk)' global.json > global.json.tmp && mv global.json.tmp global.json
+      - name: 安装 .NET SDK（四套，冻结配方）
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+            11.0.x
+          dotnet-quality: 'preview'   # 8/9/10 已 GA，实际仍会装到各自最新
+                                       # 正式版；11.0.x 目前是 preview，需要
+                                       # 这个开关才能装上
+          cache: false                # 本地不引入缓存，避免缓存状态影响还原
 
       - name: 定位 ilspycmd 项目文件
         working-directory: ilspy-src
         run: |
           set -euo pipefail
-          # 不写死路径（上游曾把目录从 ICSharpCode.Decompiler.Console
+          # 不写死路径（上游曾把目录从ICSharpCode.Decompiler.Console
           # 改名为 ICSharpCode.ILSpyCmd），按 ToolCommandName 特征搜索。
-          # 0 个或多个候选都直接失败，不再随便取第一个。
+          # 安全加固 6：0 个或多个候选都直接失败，不再随便取第一个。
           MATCHES=$(grep -rl "<ToolCommandName>ilspycmd" --include="*.csproj" . || true)
           COUNT=$(printf '%s\n' "$MATCHES" | grep -c . || true)
           if [ "$COUNT" -eq 0 ]; then
@@ -271,54 +320,24 @@ jobs:
           echo "找到项目文件: $MATCHES"
           echo "CSPROJ=$MATCHES" >> "$GITHUB_ENV"
 
-      # Restore：优先遵守上游 packages.lock.json，失败再回退为不锁定。
+      # 单次还原。刻意不做“先试 locked 模式再回退”的两段式：
+      # 上游 csproj 硬编码了 <RestoreLockedMode>true</RestoreLockedMode>，
+      # 而 lock 文件的 RID 段固定为 win-x64;win-arm64;linux-x64;osx-arm64，
+      # 传入单个 RID 时必然 NU1004——这是预期内的，所以直接关闭锁定模式，
+      # 不去跑那条注定失败、且会污染 obj/ 中间状态的试探分支。
       #
-      # 重要：这里用 -p:RuntimeIdentifier=<rid>（单数），而不是 `dotnet restore -r`。
-      #   dotnet restore -r  -> 传给 MSBuild 的是复数 RuntimeIdentifiers
-      #   dotnet publish -r  -> 传的是单数 RuntimeIdentifier（本地 bat 用的就是这个）
-      # 实测前者会让 ICSharpCode.Decompiler.Generators（netstandard2.0 的
-      # Roslyn 源生成器，被 Decompiler 以 Analyzer 方式引用）在 restore 阶段
-      # 1ms 内静默失败（MSB4181: RestoreTask returned false but did not log
-      # an error）。改成单数后，restore 的语义和 publish 隐式 restore 一致。
-      #
-      # TreatWarningsAsErrors=false：上游把"警告当错误"设成了全仓库默认，
-      # 而我们用的是更新的预览版 SDK，新增警告不应让打包中断。
+      # -p:RestoreEnablePackagePruning=false 与上游官方构建脚本一致。
       - name: Restore
         working-directory: ilspy-src
         run: |
           set -euo pipefail
+          dotnet restore "$CSPROJ" \
+            -r "$RID" \
+            -p:RestoreLockedMode=false \
+            -p:RestoreEnablePackagePruning=false
 
-          restore() {
-            dotnet restore "$CSPROJ" \
-              -p:RuntimeIdentifier="$RID" \
-              -p:TreatWarningsAsErrors=false \
-              "$@"
-          }
-
-          echo "== 尝试 1：遵守上游 packages.lock.json =="
-          if restore; then
-            echo "锁定模式 restore 成功"
-            exit 0
-          fi
-
-          echo "== 尝试 2：RestoreLockedMode=false（该 RID 不在上游 lock 文件里是预期情况）=="
-          if restore -p:RestoreLockedMode=false -p:RestoreEnablePackagePruning=false \
-              2>&1 | tee restore.log; then
-            echo "不锁定模式 restore 成功"
-            exit 0
-          fi
-
-          # 仍然失败：提取真实错误成注解，并单独 restore 一次 Generators
-          # 暴露 NuGet 没有明确报出来的原因（上一次失败的就是它）
-          tr -d '\r' < restore.log | grep -E "error " | sort -u | head -20 \
-            | while IFS= read -r line; do echo "::error::${line}"; done
-          echo "::group::诊断：单独 restore ICSharpCode.Decompiler.Generators"
-          dotnet restore ICSharpCode.Decompiler.Generators/ICSharpCode.Decompiler.Generators.csproj \
-            -p:RuntimeIdentifier="$RID" -p:RestoreLockedMode=false -v:n 2>&1 | tail -60 || true
-          echo "::endgroup::"
-          exit 1
-
-      # DebugType=none / DebugSymbols=false：从源头不生成托管 .pdb
+      # -p:DebugType=none -p:DebugSymbols=false：从源头不生成托管 .pdb，
+      # 比发布后再删更干净（不会有编译器先写盘、再被删除的浪费）
       - name: Publish self-contained
         working-directory: ilspy-src
         run: |
@@ -329,28 +348,42 @@ jobs:
             --self-contained true \
             --no-restore \
             -p:PublishSingleFile=false \
-            -p:TreatWarningsAsErrors=false \
             -p:DebugType=none \
             -p:DebugSymbols=false \
             -o "../out/${RID}"
 
-      # 清理编译参数关不掉的"垃圾"：
-      #   *.dbg       Linux 下 native 运行时组件的独立调试符号（通常体积最大）
-      #   createdump  Linux/macOS 下生成崩溃 core dump 的小工具，CLI 用不上
-      #   *.pdb       以防个别第三方依赖自带预编译 pdb
-      #   *.xml       API 文档注释
-      # 清理后会再跑一遍冒烟测试，确认删除没有影响运行。
+      # 清理发布产物里编译参数关不掉的"垃圾"：
+      #   *.dbg        —— Linux 下 native 运行时组件的独立调试符号，通常是体积大头
+      #   createdump   —— Linux/macOS 下用于生成崩溃 core dump 的小工具，CLI 用不上
+      #   *.pdb        —— 以防个别第三方依赖仍带着预编译好的 pdb 被复制进来
+      #   *.xml        —— API 文档注释（IntelliSense 用），压缩包里没意义
+      # 清理前后都打印体积，方便核对到底删了多少
       - name: 清理调试符号与无用文件
         run: |
           set -euo pipefail
           OUT_DIR="out/${RID}"
-          echo "清理前体积:"; du -sh "$OUT_DIR"
-          echo "将要删除的文件："
-          find "$OUT_DIR" -type f \( -name "*.dbg" -o -name "*.pdb" -o -name "*.xml" -o -name "createdump" \) -print
-          find "$OUT_DIR" -type f \( -name "*.dbg" -o -name "*.pdb" -o -name "*.xml" -o -name "createdump" \) -delete
-          echo "清理后体积:"; du -sh "$OUT_DIR"
+          echo "清理前体积:"
+          du -sh "$OUT_DIR"
 
-      # 公开分发二进制时，把上游的 License / 第三方声明一并放进压缩包
+          echo "将要删除的文件："
+          find "$OUT_DIR" -type f \( \
+              -name "*.dbg" -o \
+              -name "*.pdb" -o \
+              -name "*.xml" -o \
+              -name "createdump" \
+            \) -print
+
+          find "$OUT_DIR" -type f \( \
+              -name "*.dbg" -o \
+              -name "*.pdb" -o \
+              -name "*.xml" -o \
+              -name "createdump" \
+            \) -delete
+
+          echo "清理后体积:"
+          du -sh "$OUT_DIR"
+
+      #公开分发二进制时，把上游的 License / 第三方声明一并放进压缩包
       - name: 复制 License / 第三方声明
         run: |
           set -euo pipefail
@@ -364,7 +397,7 @@ jobs:
             fi
           done
           if [ "$FOUND" -eq 0 ]; then
-            echo "::warning::上游源码根目录没有找到 LICENSE / NOTICE 文件，请人工确认"
+            echo "::warning::上游源码根目录没找到 LICENSE / NOTICE 文件，请人工确认"
           fi
 
       # 冒烟测试：构建成功 != 能运行。

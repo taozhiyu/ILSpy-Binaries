@@ -44,16 +44,36 @@ name: Build & Release ilspycmd (self-contained)
 #       - 上游 packages.lock.json 与 NU1004（locked 模式失败是预期的，
 #         原本就有回退分支，不是本次故障原因）
 #       - NuGet 漏洞审计（NuGetAudit=false 之后 CI 依旧失败）
-#       - SDK 是否为预览版（换到GA 10.0.401 依旧失败）
+#   * 已排除的因素（都实测/查证过，不要再往这些方向猜）：
+#       - RID 单数 RuntimeIdentifier vs 复数 RuntimeIdentifiers
+#       - 上游 packages.lock.json 与 NU1004（locked 模式失败是预期的，
+#         原本就有回退分支，不是本次故障原因）
+#       - NuGet 漏洞审计（NuGetAudit=false 之后 CI 依旧失败）
+#       - SDK 是否为预览版（换到 GA 10.0.401 依旧失败）
 #       - 缓存冷热（冷缓存下本地也能通过）
+#       - TreatWarningsAsErrors=true（实测 true / false 都5/5 成功）
+#       - 是否并发（单 job 与 5 job 并发都 5/5 成功）
+#       - 变量传递方式（GITHUB_ENV 与 GITHUB_OUTPUT 均成功）
 #
-#   => 结论：唯一被证实与成败相关的变量是“装哪几套 SDK + global.json
-#      是否被改写”。本workflow 回到 6777f6a 的配方，并只在其上叠加
-#      不触碰构建语义的安全加固（权限分层、SHA 固定、并发锁、
-#      commit SHA 检出、脚本注入防护、checksum）。
+#   => 真正的根因：build job 把上游 tag 通过环境变量 VERSION 传入。
+#      MSBuild 会把同名环境变量当作保留属性 $(Version) 注入所有项目，
+#      而 $(Version) 是 VersionPrefix / VersionSuffix / PackageVersion
+#      的派生源。上游 tag 形如 "v11.0" 并非合法 SemVer，注入后
+#      ICSharpCode.Decompiler.Generators（唯一使用默认版本逻辑的
+#      netstandard2.0 项目）的 NuGet 版本解析失败，且被 NuGet 吞掉，
+#      只留下 MSB4181 这条无信息量的错误。
 #
-#      换言之：安全加固保留，构建配方冻结。任何试图“顺手优化”SDK /
-#      global.json / restore 分段的改动，都会重新踩进已知故障。
+#      实测证据（diag13，同一 commit、同一 SDK，各 5 次还原）：
+#        不设 VERSION         -> 5/5 成功
+#        仅设 COMMIT          -> 5/5 成功
+#        仅设 VERSION=v11.0   -> 0/5 全部失败
+#
+#      => 修复：变量改名为 RELEASE_TAG。构建配方本身无需改动，
+#         6777f6a 的配方是正确的，之前一直失败是环境变量名撞上了
+#         MSBuild 保留属性。
+#
+#      注意：本workflow 的 env 变量名不要使用 VERSION / Version /
+#      PackageVersion 等MSBuild 保留名，否则会重现同一故障。
 # ---------------------------------------------------------------------------
 
 on:
@@ -231,10 +251,22 @@ jobs:
           - linux-musl-x64
           - linux-x64
           - win-x64
-    # 安全加固 4：统一通过环境变量传递，脚本里一律用 $VERSION/$RID，
+    # 安全加固 4：统一通过环境变量传递，脚本里一律用 $RELEASE_TAG/$RID，
     # 不在 run 脚本里直接写 ${{ }}（防脚本注入）
+    #
+    # 【关键】版本号变量必须叫 RELEASE_TAG，绝不能叫 VERSION：
+    # MSBuild 会把同名环境变量当作保留属性 $(Version) 注入所有项目，
+    # 而 $(Version) 是 VersionPrefix / VersionSuffix / PackageVersion 的
+    # 派生源。上游 tag 形如 "v11.0" 并非合法 SemVer，一旦注入就会让
+    # ICSharpCode.Decompiler.Generators（唯一使用默认版本逻辑的
+    # netstandard2.0 项目）NuGet 版本解析失败，且失败形态是无任何
+    # 错误码的 MSB4181，极难定位。
+    # 已实测确认（diag13，同一 commit/同一 SDK，各5 次还原）：
+    #   不设 VERSION        -> 5/5 成功
+    #   仅设 COMMIT         -> 5/5 成功
+    #   仅设 VERSION=v11.0  -> 0/5 全部失败
     env:
-      VERSION: ${{ needs.check-version.outputs.version }}
+      RELEASE_TAG: ${{ needs.check-version.outputs.version }}
       COMMIT: ${{ needs.check-version.outputs.commit }}
       RID: ${{ matrix.rid }}
     steps:
@@ -331,76 +363,26 @@ jobs:
           echo "找到项目文件: $MATCHES"
           echo "CSPROJ=$MATCHES" >> "$GITHUB_ENV"
 
-      # ================================================================
-      # 还原前置：预热 NuGet 全局包目录
-      #
-      # 根因（11 组受控实验 + 真实 CI 日志，见 Restore 步骤上方注释）：
-      #   ICSharpCode.Decompiler.Generators 的还原在 job **冷启动瞬间**
-      #   会与 NuGet 全局包目录（~/.nuget/packages）的首次初始化发生
-      #   时序竞争，导致它在 0.3~72ms 内静默失败（MSB4181，无 NU 错误码）。
-      #
-      #   决定性证据：diag11 在同一个 job 内连续跑 20 次（每次都清空
-      #   obj/ 与 http 缓存）-> 20/20 全部 PASS；不清理再跑 10 次 ->
-      #   10/10 全 PASS。而 build job 每次都是全新冷启动 -> 必挂。
-      #   同一 job 内循环永不失败，说明命令本身没问题，
-      #   问题出在“第一次执行”这个时机。
-      #
-      # 因此在正式还原前先跑一次同参数还原做预热：把全局包目录、
-      # http 缓存、临时目录全部初始化好，让正式还原不再面对冷启动竞争。
-      # 预热失败不致命（continue-on-error），后面还有 6 次重试兜底。
-      # ================================================================
-      - name: 预热 NuGet 缓存（消除冷启动竞争）
-        working-directory: ilspy-src
-        continue-on-error: true
-        run: |
-          set -uo pipefail
-          echo "预热前全局包目录:"
-          dotnet nuget locals global-packages --list 2>&1 || true
-
-          # 与正式还原同参数跑一次，把包全部下载/解包到位
-          dotnet restore "$CSPROJ" \
-            -r "$RID" \
-            -p:RestoreLockedMode=false \
-            -p:RestoreEnablePackagePruning=false 2>&1 | tail -8 || true
-
-          echo "预热完成（无论成败，正式还原步骤会再执行一次并带重试）"
-
-      # 单次还原。刻意不做“先试 locked 模式再回退”的两段式：
+      # 还原。刻意不做“先试 locked 模式再回退”的两段式：
       # 上游 csproj 硬编码了 <RestoreLockedMode>true</RestoreLockedMode>，
       # 而 lock 文件的 RID 段固定为 win-x64;win-arm64;linux-x64;osx-arm64，
       # 传入单个 RID 时必然 NU1004——这是预期内的，所以直接关闭锁定模式，
       # 不去跑那条注定失败、且会污染 obj/ 中间状态的试探分支。
       #
       # -p:RestoreEnablePackagePruning=false 与上游官方构建脚本一致。
-      # 还原（带重试）。
       #
-      # 为什么需要重试：ICSharpCode.Decompiler.Generators 的还原是一个
-      # 已确认的**非确定性故障**（flake）——同一条命令在 CI 上时好时坏，
-      # 失败时固定表现为 MSB4181「returned false but did not log an
-      # error」，且没有任何 NUxxxx 错误码。因此正确做法是重试，
-      # 而不是继续猜配方（配方层面的猜测已被实验逐一排除）。
+      # 真正的根因（13 组受控实验定位，勿再改动上方 env 里的变量名）：
+      #   build job 把上游 tag 通过环境变量 VERSION 传进来，
+      #   而 MSBuild 会把同名环境变量当作保留属性 $(Version) 注入项目。
+      #   $(Version) 是 VersionPrefix / VersionSuffix / PackageVersion 的
+      #   派生源；上游 tag 形如 "v11.0" 不是合法 SemVer，注入后
+      #   ICSharpCode.Decompiler.Generators（唯一使用默认版本逻辑的
+      #   netstandard2.0 项目）的 NuGet 版本解析失败，且被NuGet 吞掉，
+      #   只留下 MSB4181 这条无信息量的错误。
+      #   已修：变量改名 RELEASE_TAG（见上方 env 定义）。
       #
-      # 每次重试前清掉所有 obj/ 与本地 NuGet 包缓存，强制重新解析：
-      # 失败时会留下半成品 obj/ 与不完整的 project.assets.json，
-      # 不清理的话重试仍会命中同一份坏状态。
-      #
-      # 不用“先 locked 再回退”的两段式：上游 csproj 硬编码了
-      # <RestoreLockedMode>true</RestoreLockedMode>，而 lock 文件的 RID
-      # 段固定为 win-x64;win-arm64;linux-x64;osx-arm64，传单个 RID 时
-      # 必然 NU1004——这是预期内的，直接关闭锁定模式即可，
-      # 不去跑那条注定失败、且会污染 obj/ 中间状态的试探分支。
-      #
-      # -p:RestoreEnablePackagePruning=false 与上游官方构建脚本一致。
-      #
-      # 重试为什么必须彻底清理（这一点是从失败日志里读出来的关键）：
-      # 第一次尝试时其余 4 个项目耗时 5~7s并Restored 成功，
-      # 而 Generators 只用了 43ms 就失败；随后几次尝试里它变成
-      # 0.4~4ms 瞬间失败——说明第一次失败已经写入了半成品
-      # project.assets.json / project.nuget.cache，后续重试会直接
-      # 命中这份坏状态，根本不会重新解析。因此每次重试前必须：
-      #   1) 删掉所有 obj/（含 assets / nuget.cache / nuget.g.props）
-      #   2) 清掉 NuGet 的 http 缓存（vulnerability 数据库等）
-      #   3) 清掉已解包到~/.nuget/packages 的本项目包，避免复用坏状态
+      # 下面仍保留重试作为兜底：万一将来上游再引入同类变量名冲突，
+      # 或NuGet 出现别的偶发问题，workflow 不会直接卡死。
       - name: Restore（失败自动重试）
         working-directory: ilspy-src
         run: |
@@ -528,7 +510,7 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           cd "out/${RID}"
-          zip -r -9 -q "../../dist/ilspycmd-${VERSION}-${RID}.zip" .
+          zip -r -9 -q "../../dist/ilspycmd-${RELEASE_TAG}-${RID}.zip" .
           cd ../..
           ls -lh dist
 

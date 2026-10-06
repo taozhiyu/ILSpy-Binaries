@@ -279,6 +279,20 @@ jobs:
           persist-credentials: false # 安全加固 5：第三方代码不应接触 git 凭据
           path: ilspy-src
 
+      # 只为本仓库的两个 README 额外做一次稀疏检出：它们要随包分发，
+      # 让使用者不打开浏览器也能看到说明与免责声明。
+      # 用 sparse-checkout 只取这两个文件，不下载本仓库其余内容。
+      # ref 用触发本次构建的分支/提交，保证包内文档与构建来源一致。
+      - name: 检出本仓库说明文档
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          sparse-checkout: |
+            README.md
+            README.zh.md
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+          path: repo-docs
+
       # =================================================================
       # 构建配方（已用真实 CI 运行验证）
       #
@@ -470,22 +484,91 @@ jobs:
           echo "清理后体积:"
           du -sh "$OUT_DIR"
 
-      #公开分发二进制时，把上游的 License / 第三方声明一并放进压缩包
-      - name: 复制 License / 第三方声明
+      # ---------------------------------------------------------------------
+      # 随包分发文档：上游许可 + 上游说明 + 本仓库中英文 README + 构建信息
+      #
+      # 分发二进制时，除了代码许可，还应让使用者能在包内看到：
+      #   - 上游 ILSpy 的许可证（MIT）与第三方声明
+      #   - 上游 ilspycmd 自己的使用说明（来自上游仓库的 README.md）
+      #   - 本仓库的说明（中英双语），含免责声明与 musl 依赖说明
+      #   - 本次构建的来源信息（tag / commit / SDK / 构建时间），
+      #     便于使用者追溯这个二进制到底由哪份源码构建而来
+      #
+      # 注意：ilspycmd 的 csproj 里有 <None Include="README.md" Pack="true" />，
+      # 那是给 NuGet 包用的，self-contained publish 不会把它复制到输出目录，
+      # 因此这里显式复制，并重命名为 README-UPSTREAM.md 以免与本仓库
+      # 的 README.md 混淆。
+      # ---------------------------------------------------------------------
+      - name: 随包分发许可与说明文档
         run: |
           set -euo pipefail
-          FOUND=0
+          OUT_DIR="out/${RID}"
+          DOCS=0
+
+          # ---- 1) 上游许可 / 第三方声明 ----
           for f in LICENSE LICENSE.txt LICENSE.md NOTICE NOTICE.txt \
                    THIRD-PARTY-NOTICES.txt THIRD-PARTY-NOTICES.md; do
             if [ -f "ilspy-src/$f" ]; then
-              cp "ilspy-src/$f" "out/${RID}/"
-              echo "已复制 $f"
-              FOUND=1
+              cp "ilspy-src/$f" "$OUT_DIR/"
+              echo "已复制上游 $f"
+              DOCS=$((DOCS + 1))
             fi
           done
-          if [ "$FOUND" -eq 0 ]; then
-            echo "::warning::上游源码根目录没找到 LICENSE / NOTICE 文件，请人工确认"
+
+          # ---- 2) 上游 ilspycmd 的使用说明 ----
+          UPSTREAM_README=""
+          for cand in \
+              "ilspy-src/ICSharpCode.ILSpyCmd/README.md" \
+              "$(dirname "$CSPROJ")/README.md"; do
+            if [ -f "$cand" ]; then
+              UPSTREAM_README="$cand"
+              break
+            fi
+          done
+          if [ -n "$UPSTREAM_README" ]; then
+            cp "$UPSTREAM_README" "$OUT_DIR/README-UPSTREAM.md"
+            echo "已复制上游说明文档: $UPSTREAM_README -> README-UPSTREAM.md"
+            DOCS=$((DOCS + 1))
+          else
+            echo "::warning::未找到上游 ilspycmd 的 README.md"
           fi
+
+          # ---- 3) 本仓库说明（中英双语）----
+          # 来自上方稀疏检出，取的是触发本次构建的分支版本，
+          # 保证包内文档与构建来源一致。
+          for f in README.md README.zh.md; do
+            if [ -f "repo-docs/$f" ]; then
+              cp "repo-docs/$f" "$OUT_DIR/$f"
+              echo "已复制本仓库 $f"
+              DOCS=$((DOCS + 1))
+            else
+              echo "::warning::未找到 repo-docs/$f，无法随包分发"
+            fi
+          done
+
+          # ---- 4) 构建来源信息 ----
+          {
+            echo "ilspycmd self-contained build"
+            echo "================================"
+            echo "Upstream project : ${UPSTREAM_REPO}"
+            echo "Upstream tag     : ${RELEASE_TAG}"
+            echo "Upstream commit  : ${COMMIT}"
+            echo "Target RID       : ${RID}"
+            echo "Build run        : ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "Build date (UTC) : $(date -u '+%Y-%m-%d %H:%M:%S')"
+            echo "Build SDKs       : 8.0.x 9.0.x 10.0.x 11.0.x (channel), selected by dotnet at build time"
+            echo "dotnet --version : $(cd ilspy-src && dotnet --version 2>/dev/null || echo 'n/a')"
+            echo
+            echo "This build was produced automatically by GitHub Actions."
+            echo "It is NOT an official ILSpy release and is not affiliated"
+            echo "with or endorsed by the ILSpy project or its maintainers."
+            echo "Source code and official releases: https://github.com/icsharpcode/ILSpy"
+          } > "$OUT_DIR/BUILD-INFO.txt"
+          echo "已生成 BUILD-INFO.txt"
+          DOCS=$((DOCS + 1))
+
+          echo "共随包分发 $DOCS 份文档/许可文件"
+          ls -la "$OUT_DIR" | grep -iE "LICENSE|NOTICE|README|BUILD-INFO"
 
       # ---------------------------------------------------------------------
       # musl（Alpine）包补齐 GCC 运行库依赖

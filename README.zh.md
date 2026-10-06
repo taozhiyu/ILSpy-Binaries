@@ -2,6 +2,12 @@
 
 [ILSpy](https://github.com/icsharpcode/ILSpy) 的非官方自动化、自包含二进制构建项目。
 
+[![最新版本](https://img.shields.io/github/v/release/taozhiyu/ILSpy-Binaries?display_name=tag&sort=semver)](../../releases/latest)
+[![构建状态](https://img.shields.io/github/actions/workflow/status/taozhiyu/ILSpy-Binaries/build-ilspycmd.yml?branch=main&label=build)](../../actions/workflows/build-ilspycmd.yml)
+[![许可证](https://img.shields.io/github/license/taozhiyu/ILSpy-Binaries?label=license)](../../blob/main/LICENSE)
+
+English | [简体中文](README.zh.md)
+
 本仓库自动跟踪上游 ILSpy 项目的最新稳定版本，在 GitHub Actions 中为多个平台和架构进行构建，将每个平台的构建结果打包为独立 ZIP，并自动发布到 GitHub Releases。
 
 生成的安装包采用 **Self-contained（自包含）** 方式发布，目标设备无需额外安装 .NET SDK 或 .NET Runtime 即可运行。
@@ -253,6 +259,57 @@ ILSpy 属于桌面 GUI 应用，并依赖 Avalonia、SkiaSharp 等原生组件�
 > .NET 的 musl 发布成功，并不自动意味着所有 ILSpy 原生依赖都能够在所有 musl Linux 环境中正常运行。
 
 因此，本项目会对 musl 构建进行额外的构建产物检查；实际使用时仍建议在目标 musl Linux 环境中进行验证。
+
+### 随包分发的 GCC 运行库
+
+`ilspycmd` 可执行文件声明了以下动态依赖：
+
+```text
+NEEDED  libstdc++.so.6
+NEEDED  libgcc_s.so.1
+```
+
+.NET 的 self-contained 发布只打包 .NET 运行时，**不包含** GCC 运行库；
+而最小化的 Alpine 安装默认也不提供它们。在这类系统上直接运行会报：
+
+```text
+Error loading shared library libstdc++.so.6: No such file or directory
+```
+
+为实现解压即用，所有 `linux-musl-*` 压缩包都会随附这两个库，
+并为所有相关ELF 文件注入 `RPATH=$ORIGIN`，使加载器能从包目录找到它们。
+
+| 文件                      | 体积      | 用途                 |
+| ------------------------- | --------- | -------------------- |
+| `libstdc++.so.6`          | 约 2.7 MB | C++ 标准库           |
+| `libgcc_s.so.1`           | 约 170 KB | GCC 底层运行时       |
+
+两者均来自 Alpine Linux 的 `libstdc++` 与 `libgcc` 包，
+按 [GCC Runtime Library Exception](https://www.gnu.org/licenses/gcc-exception-3.1.html) 授权再分发。
+详见包内 `LICENSE-GCC-RUNTIME-LIBRARY.txt`，
+实际打包版本见 `GCC-RUNTIME-LIBRARIES.txt`。
+
+若你的系统已提供这两个库，包内副本不会被使用，可安全删除。
+
+> 注意：如果不注入 `RPATH`，仅仅把库复制到包目录是无效的——
+> musl 加载器只搜索 `/etc/ld-musl-*.path` 与默认库目录，
+> **不会**搜索可执行文件所在目录。
+
+## 压缩包内容
+
+每个发布的 ZIP 包含：
+
+| 文件 / 目录                          | 说明                            |
+| ------------------------------------ | ------------------------------- |
+| `ilspycmd`                          | 可执行文件（自包含，无需安装 .NET） |
+| `*.dll`、`*.so`                     | 程序集与内置的 .NET 运行时       |
+| `LICENSE`                           | 上游 ILSpy 许可证（MIT）        |
+| `README.md`                         | 本文档（英文）                  |
+| `README.zh.md`                      | 本文档（中文）                  |
+| `README-UPSTREAM.md`                | 上游 `ilspycmd` 官方说明        |
+| `BUILD-INFO.txt`                    | 上游 tag、commit、构建日期与所用 SDK |
+| `LICENSE-GCC-RUNTIME-LIBRARY.txt`   | GCC 运行库许可说明（仅 musl 包）|
+| `GCC-RUNTIME-LIBRARIES.txt`         | 随包 GCC 库版本（仅 musl 包）   |
 
 ## 仓库结构
 

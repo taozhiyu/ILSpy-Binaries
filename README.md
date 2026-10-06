@@ -2,6 +2,12 @@
 
 Unofficial automated self-contained builds of [ILSpy](https://github.com/icsharpcode/ILSpy).
 
+[![Latest Release](https://img.shields.io/github/v/release/taozhiyu/ILSpy-Binaries?display_name=tag&sort=semver)](../../releases/latest)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/taozhiyu/ILSpy-Binaries/build-ilspycmd.yml?branch=main&label=build)](../../actions/workflows/build-ilspycmd.yml)
+[![License](https://img.shields.io/github/license/taozhiyu/ILSpy-Binaries?label=license)](../../blob/main/LICENSE)
+
+[简体中文](README.zh.md) | English
+
 This repository automatically tracks new stable releases from the upstream ILSpy project, builds ILSpy for multiple target platforms, packages each build as a standalone ZIP archive, and publishes the resulting binaries as GitHub Releases.
 
 The generated packages are intended to run without requiring users to install the .NET SDK or .NET Runtime separately.
@@ -167,6 +173,50 @@ and should not be treated as interchangeable.
 Because ILSpy is a desktop application and uses native components through dependencies such as Avalonia and SkiaSharp, successful .NET publishing alone does not guarantee compatibility with every musl-based environment.
 
 For this reason, musl builds should be validated on an actual musl-based system before being considered universally compatible.
+
+### Bundled GCC Runtime Libraries
+
+The `ilspycmd` executable declares the following dynamic dependencies:
+
+```text
+NEEDED  libstdc++.so.6
+NEEDED  libgcc_s.so.1
+```
+
+A self-contained .NET publish bundles the .NET runtime but **not** the GCC runtime libraries, and a minimal Alpine installation does not provide them either. Running the binary on such a system would fail with:
+
+```text
+Error loading shared library libstdc++.so.6: No such file or directory
+```
+
+To make the archives usable immediately after extraction, every `linux-musl-*` archive therefore ships these two libraries alongside the executable, and all relevant ELF binaries are patched with `RPATH=$ORIGIN` so the loader resolves them from the package directory.
+
+| File                     | Size    | Purpose                            |
+| ------------------------ | ------- | ---------------------------------- |
+| `libstdc++.so.6`         | ~2.7 MB | C++ standard library               |
+| `libgcc_s.so.1`          | ~170 KB | GCC low-level runtime              |
+
+Both files come from Alpine Linux's `libstdc++` and `libgcc` packages and are redistributed under the [GCC Runtime Library Exception](https://www.gnu.org/licenses/gcc-exception-3.1.html). See `LICENSE-GCC-RUNTIME-LIBRARY.txt` inside the archive for details, and `GCC-RUNTIME-LIBRARIES.txt` for the exact package versions.
+
+If your system already provides these libraries, the bundled copies are not used and can be safely deleted.
+
+> Note: without the bundled libraries or an `RPATH` patch, copying them into the package directory alone would not work — the musl loader searches `/etc/ld-musl-*.path` and the default library directories, **not** the directory containing the executable.
+
+## Archive Contents
+
+Each published ZIP archive contains:
+
+| File / Directory         | Description                                                        |
+| ------------------------ | ------------------------------------------------------------------ |
+| `ilspycmd`               | The executable (self-contained, no .NET installation required)      |
+| `*.dll`, `*.so`          | Application assemblies and the bundled .NET runtime                 |
+| `LICENSE`                | Upstream ILSpy license (MIT)                                        |
+| `README.md`              | This document (English)                                             |
+| `README.zh.md`           | This document (Chinese)                                             |
+| `README-UPSTREAM.md`     | Upstream `ilspycmd` documentation                                   |
+| `BUILD-INFO.txt`         | Exact upstream tag, commit, build date and SDK used                 |
+| `LICENSE-GCC-RUNTIME-LIBRARY.txt` | GCC runtime library licensing (musl packages only)        |
+| `GCC-RUNTIME-LIBRARIES.txt`         | Bundled GCC library versions (musl packages only)     |
 
 ## Repository Structure
 

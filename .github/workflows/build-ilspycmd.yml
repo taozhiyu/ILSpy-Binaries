@@ -519,7 +519,10 @@ jobs:
 
           OUT_DIR="out/${RID}"
 
-          # 从 Alpine 官方仓库取出库文件与许可证
+          # 从 Alpine 官方仓库取出库文件。
+          # 注意：Alpine 基础镜像不含任何许可证文件（实测
+          # /usr/share/licenses 不存在），因此许可证文本由下面的
+          # heredoc 内嵌写入，不依赖镜像内路径。
           docker run --rm -v "$PWD/${OUT_DIR}:/app" alpine:3 /bin/sh -c '
             set -e
             apk add --no-cache libstdc++ libgcc >/dev/null
@@ -528,13 +531,52 @@ jobs:
             cp -L /usr/lib/libgcc_s.so.1  /app/libgcc_s.so.1
             # 记录版本，便于排查与许可追溯
             apk list -I libstdc++ libgcc > /app/GCC-RUNTIME-LIBRARIES.txt
-            # 许可证全文（GPL-2.0-or-later AND LGPL-2.1-or-later
-            # + GCC Runtime Library Exception）
-            for d in /usr/share/licenses/gcc /usr/share/licenses/libstdc++ /usr/share/licenses/libgcc; do
-              [ -d "$d" ] && cp -r "$d" /app/ 2>/dev/null || true
-            done
-            apk info -L libstdc++ 2>/dev/null | grep -i licen || true
           '
+
+          # 许可证全文：GCC Runtime Library Exception 3.1
+          # （GCC 允许把运行时库与自有程序一起再分发）
+          # SPDX: GPL-2.0-or-later WITH GCC-exception-3.1
+          cat > "${OUT_DIR}/LICENSE-GCC-RUNTIME-LIBRARY.txt" <<'EOF'
+          libstdc++ (libstdc++.so.6) and libgcc_s (libgcc_s.so.1)
+          ========================================================
+
+          These runtime libraries are redistributed with ilspycmd so that the
+          linux-musl-* archives run immediately after extraction, without
+          requiring `apk add libstdc++ libgcc` on the target machine.
+
+          Source packages (Alpine Linux):
+            libstdc++-<version> x86_64 {gcc}
+            libgcc-<version>   x86_64 {gcc}
+
+          The exact versions shipped in this archive are listed in
+          GCC-RUNTIME-LIBRARIES.txt next to this file.
+
+          ------------------------------------------------------------------------
+          Licensing
+          ------------------------------------------------------------------------
+
+          Alpine's package metadata declares these packages as:
+              GPL-2.0-or-later AND LGPL-2.1-or-later
+
+          In addition, GCC's libstdc++ runtime library is distributed under the
+          GCC Runtime Library Exception, version 3.1, which explicitly permits
+          distributing the runtime library together with an independent work:
+
+            "It is permitted to distribute the runtime library as part of a
+             program, whether the program is used as a library or as an
+             executable."
+
+          Therefore the ilspycmd archives may include these files.
+
+          Full license texts:
+            GPL-2.0  https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt
+            LGPL-2.1 https://www.gnu.org/licenses/old-licenses/lgpl-2.1.txt
+            GCC Runtime Library Exception 3.1
+                    https://www.gnu.org/licenses/gcc-exception-3.1.html
+
+          If your system already provides libstdc++.so.6 and libgcc_s.so.1, the
+          copies shipped in this archive are not used and may be safely deleted.
+          EOF
 
           # 注入 RPATH，让 loader 能找到同目录的库。
           # 必须对所有依赖方都注入：实测 libcoreclr.so、libhostfxr.so、
@@ -555,8 +597,13 @@ jobs:
           # 校验：确认库和 RPATH 都在，且清单已生成
           test -f "${OUT_DIR}/libstdc++.so.6" || { echo "::error::libstdc++.so.6 缺失"; exit 1; }
           test -f "${OUT_DIR}/libgcc_s.so.1"  || { echo "::error::libgcc_s.so.1 缺失"; exit 1; }
+          # 许可证必须一起打包：Alpine 镜像里没有许可证文件，
+          # 若这里不校验，将来一旦 heredoc 写失败就会静默产出无许可证的包。
+          test -s "${OUT_DIR}/LICENSE-GCC-RUNTIME-LIBRARY.txt" \
+            || { echo "::error::GCC 运行库许可证文件缺失或为空"; exit 1; }
           cat "${OUT_DIR}/GCC-RUNTIME-LIBRARIES.txt"
-          ls -lh "${OUT_DIR}"/libstdc++.so.6 "${OUT_DIR}"/libgcc_s.so.1
+          ls -lh "${OUT_DIR}"/libstdc++.so.6 "${OUT_DIR}"/libgcc_s.so.1 \
+                  "${OUT_DIR}"/LICENSE-GCC-RUNTIME-LIBRARY.txt
 
       # 冒烟测试：构建成功 != 能运行。
       # 只有 linux-x64（runner 原生）和 linux-musl-x64（Alpine 容器）能在
@@ -660,8 +707,8 @@ jobs:
             > 说明 / Note：构建时 linux-x64 在 runner 原生运行验证；linux-musl-x64 在**纯净 Alpine 容器**中验证「解压即用」（无需 `apk add`、无需设置 `LD_LIBRARY_PATH`）；arm64 与 Windows 包为交叉编译产物，未在对应平台实机验证。
             > Only linux-x64 was executed as a smoke test on the runner; **linux-musl-x64** was verified in a **clean Alpine container** to run straight after extraction (no `apk add`, no `LD_LIBRARY_PATH`); the arm64 and Windows packages are cross-compiled and were not run on their target platforms.
 
-            > musl 包说明 / musl packages：`ilspycmd` 的 ELF 依赖 `libstdc++.so.6` 与 `libgcc_s.so.1`（self-contained 只打包 .NET 运行时，不含 GCC 运行库）。为实现解压即用，`linux-musl-*` 包内已随附这两个库，并为所有相关二进制注入了 `RPATH=$ORIGIN`。它们来自 Alpine 官方仓库的 `libstdc++` / `libgcc` 包，按 **GCC Runtime Library Exception** 许可分发，许可证全文见包内 `GCC-RUNTIME-LIBRARIES.txt` 及 `licenses/` 目录。若你的系统已提供这两个库，可安全删除包内副本。
-            > The `linux-musl-*` archives ship `libstdc++.so.6` and `libgcc_s.so.1` with `RPATH=$ORIGIN` baked in, so they run immediately after extraction with no extra packages. They come from Alpine's `libstdc++` / `libgcc` packages under the **GCC Runtime Library Exception**; see `GCC-RUNTIME-LIBRARIES.txt` and `licenses/` in the archive. If your system already provides them, deleting the bundled copies is safe.
+            > musl 包说明 / musl packages：`ilspycmd` 的 ELF 依赖 `libstdc++.so.6` 与 `libgcc_s.so.1`（self-contained 只打包 .NET 运行时，不含 GCC 运行库）。为实现解压即用，`linux-musl-*` 包内已随附这两个库，并为所有相关二进制注入了 `RPATH=$ORIGIN`。它们来自 Alpine 官方仓库的 `libstdc++` / `libgcc` 包，按 **GCC Runtime Library Exception** 许可分发；许可证说明见包内 `LICENSE-GCC-RUNTIME-LIBRARY.txt`，版本清单见 `GCC-RUNTIME-LIBRARIES.txt`。若你的系统已提供这两个库，可安全删除包内副本。
+            > The `linux-musl-*` archives ship `libstdc++.so.6` and `libgcc_s.so.1` with `RPATH=$ORIGIN` baked in, so they run immediately after extraction with no extra packages. They come from Alpine's `libstdc++` / `libgcc` packages under the **GCC Runtime Library Exception**; see `LICENSE-GCC-RUNTIME-LIBRARY.txt` and `GCC-RUNTIME-LIBRARIES.txt` in the archive. If your system already provides them, deleting the bundled copies is safe.
           files: |
             artifacts/*.zip
             artifacts/SHA256SUMS

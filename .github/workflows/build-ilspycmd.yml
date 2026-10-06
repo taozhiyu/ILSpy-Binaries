@@ -503,7 +503,12 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x "out/${RID}/ilspycmd"
-          docker run --rm -v "$PWD/out/${RID}:/app:ro" alpine:3 /app/ilspycmd --version
+          # 纯 Alpine 默认不装 libstdc++ / libgcc_s，而 self-contained 的
+          # ilspycmd 依赖它们，直接 alpine:3 会报
+          #   Error loading shared library libstdc++.so.6
+          # 因此用已预装这两个库的 alpine 镜像变体来验证。
+          docker run --rm -v "$PWD/out/${RID}:/app:ro" \
+            alpine:3 /bin/sh -c "apk add --no-cache libstdc++ libgcc >/dev/null && /app/ilspycmd --version"
 
       - name: 打包 zip
         run: |

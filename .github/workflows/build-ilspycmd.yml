@@ -572,8 +572,12 @@ jobs:
       # 关键：这里刻意用「纯净 alpine」且不设任何 LD_LIBRARY_PATH，
       # 因为发行包必须做到解压即用。若这里 apk add 了 libstdc++，
       # 就等于掩盖了 RPATH 没生效的问题。
-      - name: 冒烟测试（linux-musl，纯净 Alpine 解压即用验证）
-        if: startsWith(matrix.rid, 'linux-musl-')
+      #
+      # 只验证 linux-musl-x64：runner 是 x64_64，arm64 是交叉编译产物，
+      # 无法在这里执行（强行运行会报shell 语法错误）。
+      # arm64 的 RPATH 与库文件由同样的脚本处理，但运行验证列为已知缺口。
+      - name: 冒烟测试（linux-musl-x64，纯净 Alpine 解压即用验证）
+        if: matrix.rid == 'linux-musl-x64'
         run: |
           set -euo pipefail
           chmod +x "out/${RID}/ilspycmd"
@@ -653,8 +657,8 @@ jobs:
             下载后请用 `SHA256SUMS` 核对文件完整性。
             Please verify downloads against the checksums in `SHA256SUMS`.
 
-            > 说明 / Note：构建时 linux-x64 原生运行验证；两个 musl 包在**纯净 Alpine 容器**中验证「解压即用」（无需 `apk add`、无需设置 `LD_LIBRARY_PATH`）；arm64 与 Windows 包为交叉编译产物，未在对应平台实机验证。
-            > Only linux-x64 was executed as a smoke test on the runner; the two musl packages were verified **in a clean Alpine container** to run straight after extraction (no `apk add`, no `LD_LIBRARY_PATH`); the arm64 and Windows packages are cross-compiled and were not run on their target platforms.
+            > 说明 / Note：构建时 linux-x64 在 runner 原生运行验证；linux-musl-x64 在**纯净 Alpine 容器**中验证「解压即用」（无需 `apk add`、无需设置 `LD_LIBRARY_PATH`）；arm64 与 Windows 包为交叉编译产物，未在对应平台实机验证。
+            > Only linux-x64 was executed as a smoke test on the runner; **linux-musl-x64** was verified in a **clean Alpine container** to run straight after extraction (no `apk add`, no `LD_LIBRARY_PATH`); the arm64 and Windows packages are cross-compiled and were not run on their target platforms.
 
             > musl 包说明 / musl packages：`ilspycmd` 的 ELF 依赖 `libstdc++.so.6` 与 `libgcc_s.so.1`（self-contained 只打包 .NET 运行时，不含 GCC 运行库）。为实现解压即用，`linux-musl-*` 包内已随附这两个库，并为所有相关二进制注入了 `RPATH=$ORIGIN`。它们来自 Alpine 官方仓库的 `libstdc++` / `libgcc` 包，按 **GCC Runtime Library Exception** 许可分发，许可证全文见包内 `GCC-RUNTIME-LIBRARIES.txt` 及 `licenses/` 目录。若你的系统已提供这两个库，可安全删除包内副本。
             > The `linux-musl-*` archives ship `libstdc++.so.6` and `libgcc_s.so.1` with `RPATH=$ORIGIN` baked in, so they run immediately after extraction with no extra packages. They come from Alpine's `libstdc++` / `libgcc` packages under the **GCC Runtime Library Exception**; see `GCC-RUNTIME-LIBRARIES.txt` and `licenses/` in the archive. If your system already provides them, deleting the bundled copies is safe.

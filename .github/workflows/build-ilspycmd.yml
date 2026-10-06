@@ -236,6 +236,13 @@ jobs:
           # 若仍是 preview（如 11.0.x），需要这个开关才能装上
           dotnet-quality: 'preview'
 
+      # 诊断：打印实际生效的 SDK 解析结果（global.json 解析失败会在这里直接暴露）
+      - name: 诊断：dotnet --info
+        working-directory: ilspy-src
+        run: |
+          set -euo pipefail
+          dotnet --info
+
       # 如果后续 restore/publish 阶段 dotnet CLI 自己也因 global.json 报
       # "compatible SDK not found"，再启用下面这个兜底（删除 sdk 锁定段，
       # 保留 msbuild-sdks 等其它内容）。目前按官方 CI 的做法判断不需要。
@@ -264,25 +271,52 @@ jobs:
           echo "找到项目文件: $MATCHES"
           echo "CSPROJ=$MATCHES" >> "$GITHUB_ENV"
 
-      # 优先遵守上游 packages.lock.json（可复现性更好）；
-      # 只有锁定模式失败时（比如该 RID 不在 lock 文件里）才回退为不锁定。
-      - name: Restore（优先遵守上游锁定文件）
-        id: restore_locked
+      # Restore：优先遵守上游 packages.lock.json，失败再回退为不锁定。
+      #
+      # 重要：这里用 -p:RuntimeIdentifier=<rid>（单数），而不是 `dotnet restore -r`。
+      #   dotnet restore -r  -> 传给 MSBuild 的是复数 RuntimeIdentifiers
+      #   dotnet publish -r  -> 传的是单数 RuntimeIdentifier（本地 bat 用的就是这个）
+      # 实测前者会让 ICSharpCode.Decompiler.Generators（netstandard2.0 的
+      # Roslyn 源生成器，被 Decompiler 以 Analyzer 方式引用）在 restore 阶段
+      # 1ms 内静默失败（MSB4181: RestoreTask returned false but did not log
+      # an error）。改成单数后，restore 的语义和 publish 隐式 restore 一致。
+      #
+      # TreatWarningsAsErrors=false：上游把"警告当错误"设成了全仓库默认，
+      # 而我们用的是更新的预览版 SDK，新增警告不应让打包中断。
+      - name: Restore
         working-directory: ilspy-src
-        continue-on-error: true
         run: |
           set -euo pipefail
-          dotnet restore "$CSPROJ" -r "$RID"
 
-      - name: Restore（锁定模式失败时回退）
-        if: steps.restore_locked.outcome == 'failure'
-        working-directory: ilspy-src
-        run: |
-          set -euo pipefail
-          echo "锁定模式 restore 失败，回退为 RestoreLockedMode=false 重试"
-          dotnet restore "$CSPROJ" -r "$RID" \
-            -p:RestoreLockedMode=false \
-            -p:RestoreEnablePackagePruning=false
+          restore() {
+            dotnet restore "$CSPROJ" \
+              -p:RuntimeIdentifier="$RID" \
+              -p:TreatWarningsAsErrors=false \
+              "$@"
+          }
+
+          echo "== 尝试 1：遵守上游 packages.lock.json =="
+          if restore; then
+            echo "锁定模式 restore 成功"
+            exit 0
+          fi
+
+          echo "== 尝试 2：RestoreLockedMode=false（该 RID 不在上游 lock 文件里是预期情况）=="
+          if restore -p:RestoreLockedMode=false -p:RestoreEnablePackagePruning=false \
+              2>&1 | tee restore.log; then
+            echo "不锁定模式 restore 成功"
+            exit 0
+          fi
+
+          # 仍然失败：提取真实错误成注解，并单独 restore 一次 Generators
+          # 暴露 NuGet 没有明确报出来的原因（上一次失败的就是它）
+          tr -d '\r' < restore.log | grep -E "error " | sort -u | head -20 \
+            | while IFS= read -r line; do echo "::error::${line}"; done
+          echo "::group::诊断：单独 restore ICSharpCode.Decompiler.Generators"
+          dotnet restore ICSharpCode.Decompiler.Generators/ICSharpCode.Decompiler.Generators.csproj \
+            -p:RuntimeIdentifier="$RID" -p:RestoreLockedMode=false -v:n 2>&1 | tail -60 || true
+          echo "::endgroup::"
+          exit 1
 
       # DebugType=none / DebugSymbols=false：从源头不生成托管 .pdb
       - name: Publish self-contained
@@ -295,6 +329,7 @@ jobs:
             --self-contained true \
             --no-restore \
             -p:PublishSingleFile=false \
+            -p:TreatWarningsAsErrors=false \
             -p:DebugType=none \
             -p:DebugSymbols=false \
             -o "../out/${RID}"

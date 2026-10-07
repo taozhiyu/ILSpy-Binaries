@@ -1406,7 +1406,7 @@ jobs:
           body: |
             ## 简介
             
-            自动构建自 ${{ needs.check-version.outputs.release_url }}（commit `${{ needs.check-version.outputs.commit }}`）的 `ilspycmd` self-contained 版本。压缩包内已包含对应平台的 .NET 运行时，解压即可直接运行，**目标机器无需安装 .NET SDK/Runtime**。已移除调试符号（`*.pdb` / `*.dbg`）、`createdump` 及 API 文档注释（`*.xml`）等对最终用户无用的文件，仅保留运行所需内容。
+            自动构建自 ${{ needs.check-version.outputs.release_url }} （commit `${{ needs.check-version.outputs.commit }}`）的 `ilspycmd` self-contained 版本。压缩包内已包含对应平台的 .NET 运行时，解压即可直接运行，**目标机器无需安装 .NET SDK/Runtime**。已移除调试符号（`*.pdb` / `*.dbg`）、`createdump` 及 API 文档注释（`*.xml`）等对最终用户无用的文件，仅保留运行所需内容。
             
             本 Release 由 GitHub Actions 定时自动生成，非 ILSpy 官方发布。
             

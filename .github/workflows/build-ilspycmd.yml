@@ -279,16 +279,17 @@ jobs:
           persist-credentials: false # 安全加固 5：第三方代码不应接触 git 凭据
           path: ilspy-src
 
-      # 只为本仓库的两个 README 额外做一次稀疏检出：它们要随包分发，
-      # 让使用者不打开浏览器也能看到说明与免责声明。
-      # 用 sparse-checkout 只取这两个文件，不下载本仓库其余内容。
+      # 只为本仓库的说明文档与许可证正文做额外一次稀疏检出：它们要随包分发，
+      # 让使用者不打开浏览器也能看到说明、免责声明与完整许可文本。
+      # 用 sparse-checkout 只取这些文件，不下载本仓库其余内容。
       # ref 用触发本次构建的分支/提交，保证包内文档与构建来源一致。
-      - name: 检出本仓库说明文档
+      - name: 检出本仓库说明文档与许可证正文
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           sparse-checkout: |
             README.md
             README.zh.md
+            licenses/
           sparse-checkout-cone-mode: false
           persist-credentials: false
           path: repo-docs
@@ -488,7 +489,8 @@ jobs:
       # 随包分发文档：上游许可 + 上游说明 + 本仓库中英文 README + 构建信息
       #
       # 分发二进制时，除了代码许可，还应让使用者能在包内看到：
-      #   - 上游 ILSpy 的许可证（MIT）与第三方声明
+      #   - 上游 ILSpy 的许可证（MIT）
+      #   - 上游维护的第三方组件声明（doc/third-party-notices.txt）
       #   - 上游 ilspycmd 自己的使用说明（来自上游仓库的 README.md）
       #   - 本仓库的说明（中英双语），含免责声明与 musl 依赖说明
       #   - 本次构建的来源信息（tag / commit / SDK / 构建时间），
@@ -498,6 +500,11 @@ jobs:
       # 那是给 NuGet 包用的，self-contained publish 不会把它复制到输出目录，
       # 因此这里显式复制，并重命名为 README-UPSTREAM.md 以免与本仓库
       # 的 README.md 混淆。
+      #
+      # 【合规要点】MIT 只要求"随副本附带版权声明"，因此上游 LICENSE 足够。
+      # 但 ilspycmd 依赖 NuGet.Protocol / McMaster.Extensions.Hosting.CommandLine
+      # 等 Apache-2.0 组件，Apache-2.0 第 4 条要求保留 NOTICE/归属声明，
+      # 因此必须把上游的 doc/third-party-notices.txt 一并打包。
       # ---------------------------------------------------------------------
       - name: 随包分发许可与说明文档
         run: |
@@ -505,9 +512,21 @@ jobs:
           OUT_DIR="out/${RID}"
           DOCS=0
 
-          # ---- 1) 上游许可 / 第三方声明 ----
-          for f in LICENSE LICENSE.txt LICENSE.md NOTICE NOTICE.txt \
-                   THIRD-PARTY-NOTICES.txt THIRD-PARTY-NOTICES.md; do
+          # ---- 1) 上游许可 ----
+          # 上游文件名就是 LICENSE（无扩展名）。实测 LICENSE.txt / LICENSE.md
+          # 在上游均返回 404，不要凭直觉枚举后缀。
+          for f in LICENSE LICENSE.txt LICENSE.md COPYING COPYING.txt; do
+            if [ -f "ilspy-src/$f" ]; then
+              cp "ilspy-src/$f" "$OUT_DIR/"
+              echo "已复制上游 $f"
+              DOCS=$((DOCS + 1))
+            fi
+          done
+
+          # ---- 1b) 上游第三方组件声明（在 doc/ 子目录，不在仓库根）----
+          # 上游结构实测：doc/third-party-notices.txt、doc/copyright.txt
+          for f in doc/third-party-notices.txt doc/copyright.txt \
+                   doc/license.txt doc/LICENSE.txt; do
             if [ -f "ilspy-src/$f" ]; then
               cp "ilspy-src/$f" "$OUT_DIR/"
               echo "已复制上游 $f"
@@ -616,10 +635,34 @@ jobs:
             apk list -I libstdc++ libgcc > /app/GCC-RUNTIME-LIBRARIES.txt
           '
 
-          # 许可证全文：GCC Runtime Library Exception 3.1
-          # （GCC 允许把运行时库与自有程序一起再分发）
-          # SPDX: GPL-2.0-or-later WITH GCC-exception-3.1
-          cat > "${OUT_DIR}/LICENSE-GCC-RUNTIME-LIBRARY.txt" <<'EOF'
+          # 许可证必须与二进制一起分发。GPL 要求随分发附带许可*全文*，
+          # 仅给 URL 链接不满足该要求。Alpine 镜像里也没有许可证文件，
+          # 因此正文来自本仓库 licenses/ 目录（稀疏检出已带入），
+          # 在这里拼接成一份随包文档。
+          #
+          # 依据（已核实，勿凭直觉改写）：
+          #   - 上游 GCC 官方文档明确 libstdc++ 的许可为
+          #     GPL-3.0-or-later WITH GCC-exception-3.1
+          #     （gcc.gnu.org/onlinedocs/libstdc++/manual/license.html）
+          #   - GCC Runtime Library Exception 不是独立许可证，而是叠加在
+          #     GPL 之上的附加许可；真正授权再分发的是其第 1 节。
+          #     写成"按 GCC Runtime Library Exception 授权"是不准确的。
+          #   - Alpine 的包元数据把 gcc 源包整体标为
+          #     GPL-2.0-or-later AND LGPL-2.1-or-later，那是整包标签，
+          #     不是这两个文件的准确许可。
+          #   - libstdc++ 是 GPLv3+exception3.1，libgcc_s 亦然；
+          #     LGPL-2.1 在此不适用于这两个 .so，勿照抄 Alpine 标签。
+          # -------------------------------------------------------------------
+          GPL_TXT="repo-docs/licenses/GPL-3.0.txt"
+          EXC_TXT="repo-docs/licenses/GCC-Runtime-Library-Exception-3.1.txt"
+
+          # 许可证正文是本仓库的合规底线，缺失必须硬失败（此前踩过：
+          # cp 失败被 || true 吞掉，产物无许可证但 CI 全绿）
+          test -s "$GPL_TXT" || { echo "::error::缺少 GPLv3 正文: $GPL_TXT"; exit 1; }
+          test -s "$EXC_TXT" || { echo "::error::缺少 GCC 例外正文: $EXC_TXT"; exit 1; }
+
+          {
+            cat <<'HEADER'
           libstdc++ (libstdc++.so.6) and libgcc_s (libgcc_s.so.1)
           ========================================================
 
@@ -627,39 +670,67 @@ jobs:
           linux-musl-* archives run immediately after extraction, without
           requiring `apk add libstdc++ libgcc` on the target machine.
 
-          Source packages (Alpine Linux):
-            libstdc++-<version> x86_64 {gcc}
-            libgcc-<version>   x86_64 {gcc}
-
-          The exact versions shipped in this archive are listed in
+          The files are taken UNMODIFIED from the official Alpine Linux
+          repositories (the libstdc++ and libgcc packages of the gcc source
+          package). The exact versions shipped in this archive are listed in
           GCC-RUNTIME-LIBRARIES.txt next to this file.
 
           ------------------------------------------------------------------------
-          Licensing
+          License
           ------------------------------------------------------------------------
 
-          Alpine's package metadata declares these packages as:
-              GPL-2.0-or-later AND LGPL-2.1-or-later
+          Upstream GCC distributes these runtime libraries under:
 
-          In addition, GCC's libstdc++ runtime library is distributed under the
-          GCC Runtime Library Exception, version 3.1, which explicitly permits
-          distributing the runtime library together with an independent work:
+              GPL-3.0-or-later WITH GCC-exception-3.1
 
-            "It is permitted to distribute the runtime library as part of a
-             program, whether the program is used as a library or as an
-             executable."
+          That is, the GNU General Public License version 3 (or, at your
+          option, any later version) together with the GCC Runtime Library
+          Exception 3.1.
 
-          Therefore the ilspycmd archives may include these files.
+          Note that the GCC Runtime Library Exception is NOT a standalone
+          license. It is an additional permission layered on top of the GPL.
+          The clause that actually authorizes redistribution is Section 1 of
+          the Exception, reproduced in full below.
 
-          Full license texts:
-            GPL-2.0  https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt
-            LGPL-2.1 https://www.gnu.org/licenses/old-licenses/lgpl-2.1.txt
-            GCC Runtime Library Exception 3.1
-                    https://www.gnu.org/licenses/gcc-exception-3.1.html
+          Alpine Linux's own package metadata tags the gcc source package as
+          "GPL-2.0-or-later AND LGPL-2.1-or-later". That is Alpine's packaging
+          label for the package as a whole, not the precise license of these
+          two shared objects. The authoritative statement is the upstream GCC
+          one given above.
+
+          The full text of the GNU General Public License version 3 and of the
+          GCC Runtime Library Exception 3.1 follows. The GPL requires that the
+          license text accompany the redistributed binaries, so the complete
+          texts are reproduced here rather than merely linked.
+
+          ------------------------------------------------------------------------
+          GNU GENERAL PUBLIC LICENSE, Version 3
+          ------------------------------------------------------------------------
+
+          HEADER
+            cat "$GPL_TXT"
+            cat <<'MID'
+          ------------------------------------------------------------------------
+          GCC RUNTIME LIBRARY EXCEPTION, Version 3.1
+          ------------------------------------------------------------------------
+
+          MID
+            cat "$EXC_TXT"
+            cat <<'FOOTER'
+          ------------------------------------------------------------------------
 
           If your system already provides libstdc++.so.6 and libgcc_s.so.1, the
           copies shipped in this archive are not used and may be safely deleted.
-          EOF
+          FOOTER
+          } > "${OUT_DIR}/LICENSE-GCC-RUNTIME-LIBRARY.txt"
+
+          # 体积自检：两份正文合计约 38KB，若明显偏小说明正文被截断
+          LICENSE_BYTES=$(wc -c < "${OUT_DIR}/LICENSE-GCC-RUNTIME-LIBRARY.txt")
+          echo "LICENSE-GCC-RUNTIME-LIBRARY.txt: ${LICENSE_BYTES} 字节"
+          if [ "$LICENSE_BYTES" -lt 30000 ]; then
+            echo "::error::许可证文件偏小（${LICENSE_BYTES} 字节），正文可能被截断"
+            exit 1
+          fi
 
           # 注入 RPATH，让 loader 能找到同目录的库。
           # 必须对所有依赖方都注入：实测 libcoreclr.so、libhostfxr.so、
@@ -756,6 +827,267 @@ jobs:
           sha256sum *.zip > SHA256SUMS
           cat SHA256SUMS
 
+      # -------------------------------------------------------------------
+      # 生成 latest.json 并回写到「全部」Release
+      #
+      # 【为什么不能只用 GitHub 的 releases/latest】
+      # GitHub 的 latest 指向「发布时间最新」的非 draft、非 prerelease Release。
+      # 上游完全可能先发 v11.0、之后补发 v10.0（回溯版本、重建、误操作等），
+      # 此时 GitHub 的 latest 会指向 v10.0 —— 语义错误。
+      # 因此这里必须自己枚举全部 Release，用 SemVer 数值比较取最大者。
+      #
+      # 【为什么回写到全部 Release 而不是仅当前这个】
+      # 用户通常通过 releases/latest/download/latest.json 取清单，但该别名
+      # 会随 GitHub 的 latest 漂移。为了让「任何一个 Release 里的latest.json」
+      # 都给出同一个正确的最新版本，这里把同一份内容写到所有 Release。
+      # -------------------------------------------------------------------
+      - name: 生成 latest.json（按 SemVer 解析最新版本）
+        id: latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
+          UPSTREAM_URL: ${{ needs.check-version.outputs.release_url }}
+          CURRENT_TAG: ${{ needs.check-version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          echo "::group::枚举全部 Release 并按 SemVer 排序"
+
+          # 只保留正式版（排除 draft 与 prerelease），与 latest.json 的语义一致
+          ALL_JSON=$(curl -fsS --retry 3 --retry-all-errors \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GH_REPO}/releases?per_page=100")
+
+          # 提取 tag：排除 draft 与 prerelease
+          #
+          # grep 用严格格式：可选 v 前缀 + 至少两段纯数字 + 可选第三段数字，
+          # 且后面不能再跟任何字符。宽泛的 '^v?[0-9]+\.[0-9]+' 会放行
+          #     注意：本仓库 tag 直接取自上游 icsharpcode/ILSpy 的 tag_name，
+          #     上游目前是三段式（v9.1 / v11.0），故两段+可选第三段足够。
+          #     若上游改用四段式（如 v11.0.1.2），此处会全滤掉导致 TAGS 为空
+          #     而 exit 1。届时需放宽为 ^v?[0-9]+(\.[0-9]+)*$。
+          # v11.x / v11.0-rc 之类脏值：它们的数值段会被兜底成 0，与合法
+          # 版本算作同分，导致 latest.json 指向不确定（实测 v11.x 会胜出）。
+          TAGS=$(printf '%s' "$ALL_JSON" \
+            | jq -r '.[] | select(.draft==false and .prerelease==false) | .tag_name' \
+            | grep -E '^v?[0-9]+\.[0-9]+(\.[0-9]+)?$' \
+            | sort -u)
+
+          if [ -z "$TAGS" ]; then
+            echo "::error::没有任何可解析的正式版 Release tag"
+            exit 1
+          fi
+
+          # ---- SemVer 数值比较 ----
+          # 不能用 sort -V：它对 "v11.0" 与 "v11.0.1" 之类边界行为不够可控，
+          # 这里显式拆成 major/minor/patch 三段做整数比较。
+          # 缺省段补 0，因此 v11.0 与 v11.0.0 等价。
+          #
+          # 【已实测修复的两个坑，勿改回】
+          #   1) 必须用严格大于（-gt），不能用 -ge/>=：v11.0 与 v11.0-rc.1 的
+          #      major/minor/patch 完全相同，若同分也替换则先遇到的 rc 会胜出，
+          #      latest.json 会错误地指向预发布版本。严格大于是让数值完全相同
+          #      时保持先出现者胜出。
+          #   2) 必须显式跳过含 - 或 + 的 tag：GitHub 的 .prerelease 标记未必
+          #      覆盖所有情况（手动打的 rc tag 可能被标为正式版），而且 rc 与
+          #      正式版数值全同，不跳过就会污染比较结果。
+          BEST_TAG=""
+          BEST_MAJOR=-1; BEST_MINOR=-1; BEST_PATCH=-1
+          COMPARED=""
+
+          while IFS= read -r t; do
+            [ -n "$t" ] || continue
+            # 含预发布/构建元数据的 tag 一律跳过：正式版优先
+            case "$t" in *-*|*+*) echo "跳过非正式版 tag: $t"; continue ;; esac
+            body="${t#v}"
+            core="${body%%-*}"
+            core="${core%%+*}"
+            maj="${core%%.*}"; rest="${core#*.}"
+            min="${rest%%.*}"; pat="${rest#*.}"
+            case "$pat" in *.*) pat="${pat%%.*}" ;; esac
+            # 非纯数字段一律当 0，防止排序错乱
+            is_num() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+            is_num "$maj" || maj=0
+            is_num "$min" || min=0
+            is_num "$pat" || pat=0
+
+            COMPARED="${COMPARED}${COMPARED:+,}${t}"
+
+            if [ "$maj" -gt "$BEST_MAJOR" ] \
+               || { [ "$maj" -eq "$BEST_MAJOR" ] && [ "$min" -gt "$BEST_MINOR" ]; } \
+               || { [ "$maj" -eq "$BEST_MAJOR" ] && [ "$min" -eq "$BEST_MINOR" ] \
+                    && [ "$pat" -gt "$BEST_PATCH" ]; }; then
+              BEST_TAG="$t"; BEST_MAJOR="$maj"; BEST_MINOR="$min"; BEST_PATCH="$pat"
+            fi
+          done <<< "$TAGS"
+
+          if [ -z "$BEST_TAG" ]; then
+            echo "::error::SemVer 比较失败，未选出最新版本"
+            exit 1
+          fi
+
+          echo "参与比较的 tag: ${COMPARED}"
+          echo "SemVer 最大值: ${BEST_TAG} (${BEST_MAJOR}.${BEST_MINOR}.${BEST_PATCH})"
+          echo "本次构建的 tag: ${CURRENT_TAG}"
+          if [ "$BEST_TAG" != "$CURRENT_TAG" ]; then
+            echo "::notice::最新版本(${BEST_TAG})与本次构建版本(${CURRENT_TAG})不同，"
+            echo "::notice::latest.json 将指向 ${BEST_TAG}。"
+            echo "::notice::这说明存在发布时间更晚但版本更低的 Release，"
+            echo "::notice::latest.json 已按 SemVer 纠正为 ${BEST_TAG}。"
+          fi
+
+          # ---- 收集被选中版本的资产与校验和 ----
+          TARGET_JSON=$(printf '%s' "$ALL_JSON" | jq -c --arg t "$BEST_TAG" \
+            '.[] | select(.tag_name == $t)')
+          TARGET_URL=$(printf '%s' "$TARGET_JSON" | jq -r '.html_url')
+
+          # 本步骤运行在「创建本次 Release」之前，因此当 BEST_TAG 就是本次
+          # 构建的 tag 时，目标 Release 还不存在，SHA256SUMS 只能取本地
+          # artifacts/；当 BEST_TAG 是历史版本时，必须下载那一版自己的
+          # SHA256SUMS，否则会把当前版本的摘要错配给历史版本。
+          LOCAL_SUMS="$(pwd)/artifacts/SHA256SUMS"
+          if [ "$BEST_TAG" = "$CURRENT_TAG" ]; then
+            echo "latest 版本即本次构建版本，使用本地 SHA256SUMS"
+            SUMS_FILE="$LOCAL_SUMS"
+          else
+            echo "latest 版本 ${BEST_TAG} 是历史版本，下载其自身的 SHA256SUMS"
+            SUMS_FILE="$(pwd)/SHA256SUMS-${BEST_TAG}"
+            curl -fsS --retry 3 --retry-all-errors -L \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/octet-stream" \
+              -o "$SUMS_FILE" \
+              "${SERVER_URL}/${GH_REPO}/releases/download/${BEST_TAG}/SHA256SUMS" \
+              || { echo "::error::无法获取 ${BEST_TAG} 的 SHA256SUMS"; exit 1; }
+          fi
+
+          test -s "$SUMS_FILE" || { echo "::error::SHA256SUMS 为空: $SUMS_FILE"; exit 1; }
+
+          for rid in ${RID_LIST}; do
+            name="ilspycmd-${BEST_TAG}-${rid}.zip"
+            # 缺任一 RID 说明该版本资产不全，不能作为 latest
+            if ! printf '%s' "$TARGET_JSON" | jq -e --arg n "$name" \
+                 '.assets[]? | select(.name == $n)' >/dev/null; then
+              echo "::error::版本 ${BEST_TAG} 缺少资产 ${name}，无法生成 latest.json"
+              exit 1
+            fi
+            # 摘要也必须存在，否则 sha256 会是 null
+            if ! grep -q " ${name}\$" "$SUMS_FILE" 2>/dev/null \
+               && ! grep -q "\*${name}\$" "$SUMS_FILE" 2>/dev/null; then
+              echo "::error::SHA256SUMS 中缺少 ${name} 的摘要（来源: $SUMS_FILE）"
+              exit 1
+            fi
+          done
+
+          {
+            echo "tag=$BEST_TAG"
+            echo "url=$TARGET_URL"
+            echo "compared=$COMPARED"
+          } >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+
+          # ---- 生成 JSON ----
+          # 用 jq --arg 逐字段注入，避免任何手工转义带来的注入风险。
+          # 注意：资产 URL 用构造方式而非读取 API 返回的 browser_download_url，
+          # 因为后者指向 objects.githubusercontent.com 的重定向地址，
+          # 不是稳定可用的公开地址。
+          jq -n \
+            --arg repo "$SERVER_URL/${GH_REPO}" \
+            --arg latest_version "$BEST_TAG" \
+            --arg upstream_repo "https://github.com/${UPSTREAM_REPO}" \
+            --arg upstream_url "$UPSTREAM_URL" \
+            --arg upstream_tag "$BEST_TAG" \
+            --arg compared "$COMPARED" \
+            --arg generated "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+            --rawfile sums "$SUMS_FILE" \
+            '
+            # 从 SHA256SUMS 文本行解析成 {文件名: 摘要}
+            # 【已实测修复的两个坑，勿改回】
+            #  a) 必须用 --rawfile，不能用 --slurpfile。SHA256SUMS 是纯文本，
+            #     不是合法 JSON；--slurpfile 会按 JSON 解析并直接失败
+            #     (exit 3, Invalid JSON text)，latest.json 根本生成不出来。
+            #     --rawfile 把整个文件读成单个字符串，所以用 $sums 而非 $sums[0]。
+            #  b) 正则需要 2 个反斜杠（\\s / \\*）。转义链路是：
+            #     YAML block scalar(原样) -> shell 单引号(原样) -> jq 程序文本，
+            #     jq 再按 JSON 规则解码自己的字符串字面量。所以文件里写 2 个
+            #     反斜杠，解码后正则引擎才收到 1 个，即空白类 \s 与字面星号 \*。
+            #     写成 1 个：jq 直接 Invalid \escape 编译失败；
+            #     写成 4 个：解码成 2 个，正则变成匹配「字面反斜杠+s」，sha256 全null。
+            #     注意 \\*? 末尾的 ? 必须保留，去掉会丢失「二进制模式可选」语义。
+            ($sums
+             | split("\n")
+             | map(select(length > 0)
+             | capture("^(?<hash>[0-9a-f]{64})\\s+\\*?(?<name>.+)$"))
+             | map({key: .name, value: .hash})
+             | from_entries) as $H
+            | {
+              schema_version: 1,
+              repository: $repo,
+              latest_version: $latest_version,
+              upstream_version: $upstream_tag,
+              upstream_repository: $upstream_repo,
+              upstream_release_url: $upstream_url,
+              generated_at: $generated,
+              version_resolution: {
+                method: "semver",
+                _comment: "method=semver 表示 latest_version 由 SemVer 数值比较得出，未使用发布时间。GitHub 内置的 releases/latest 按发布时间选取，在先发 v11.0 后发 v10.0 时会错误地指向 v10.0，故本文件不采信它。",
+                compared_tags: ($compared | split(",") | map(select(length > 0))),
+                excluded_drafts: true,
+                excluded_prereleases: true
+              },
+              assets: (
+                [ "linux-arm64", "linux-musl-arm64", "linux-musl-x64", "linux-x64", "win-x64" ]
+                | map(. as $rid
+                    | ("ilspycmd-" + $latest_version + "-" + $rid + ".zip") as $fname
+                    | {
+                        rid: $rid,
+                        file: $fname,
+                        url: ($repo + "/releases/download/" + $latest_version + "/" + $fname),
+                        sha256: ($H[$fname] // null)
+                      })
+              ),
+              checksums: {
+                file: "SHA256SUMS",
+                url: ($repo + "/releases/download/" + $latest_version + "/SHA256SUMS"),
+                _comment: "sha256 取自该版本的 SHA256SUMS，与 assets[].sha256 同源。"
+              },
+              license: {
+                repository: "MIT",
+                upstream: "MIT",
+                _comment: "repository 指本仓库原创文件；upstream 指随包分发的 ILSpy 二进制。仅 linux-musl-* 包额外包含 GCC 运行时库。",
+                gcc_runtime_libraries: "GPL-3.0-or-later WITH GCC-exception-3.1",
+                gcc_runtime_libraries_scope: "linux-musl-* only"
+              },
+              _comment_version: "本文件由 GitHub Actions 自动生成，请勿手工编辑。",
+              _comment_latest: "latest_version 是按 SemVer 解析出的最大版本，不是发布时间最新的版本。"
+            }
+            ' > latest.json
+
+          echo "::group::latest.json 内容"
+          cat latest.json
+          echo "::endgroup::"
+
+          # 校验：5 个 RID 的 sha256 必须都已填上，不能有 null
+          NULL_COUNT=$(jq '[.assets[] | select(.sha256 == null)] | length' latest.json)
+          if [ "$NULL_COUNT" -ne 0 ]; then
+            echo "::error::latest.json 中有 ${NULL_COUNT} 个资产缺少 sha256"
+            jq '.assets' latest.json
+            exit 1
+          fi
+
+          # 校验：latest_version 必须确实存在于 Release 中
+          if ! printf '%s' "$ALL_JSON" | jq -e --arg t "$BEST_TAG" \
+               '.[] | select(.tag_name == $t)' >/dev/null; then
+            echo "::error::latest.json 指向不存在的 Release: ${BEST_TAG}"
+            exit 1
+          fi
+
+          {
+            echo "tag=$BEST_TAG"
+            echo "url=$TARGET_URL"
+          } >> "$GITHUB_OUTPUT"
+
       - name: 发布 GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
@@ -787,11 +1119,62 @@ jobs:
             下载后请用 `SHA256SUMS` 核对文件完整性。
             Please verify downloads against the checksums in `SHA256SUMS`.
 
-            > 说明 / Note：构建时 linux-x64 在 runner 原生运行验证；linux-musl-x64 在**纯净 Alpine 容器**中验证「解压即用」（无需 `apk add`、无需设置 `LD_LIBRARY_PATH`）；arm64 与 Windows 包为交叉编译产物，未在对应平台实机验证。
+            > 说明 / Note：构建时 linux-x64 在runner 原生运行验证；linux-musl-x64 在**纯净 Alpine 容器**中验证「解压即用」（无需 `apk add`、无需设置 `LD_LIBRARY_PATH`）；arm64 与 Windows 包为交叉编译产物，未在对应平台实机验证。
             > Only linux-x64 was executed as a smoke test on the runner; **linux-musl-x64** was verified in a **clean Alpine container** to run straight after extraction (no `apk add`, no `LD_LIBRARY_PATH`); the arm64 and Windows packages are cross-compiled and were not run on their target platforms.
 
-            > musl 包说明 / musl packages：`ilspycmd` 的 ELF 依赖 `libstdc++.so.6` 与 `libgcc_s.so.1`（self-contained 只打包 .NET 运行时，不含 GCC 运行库）。为实现解压即用，`linux-musl-*` 包内已随附这两个库，并为所有相关二进制注入了 `RPATH=$ORIGIN`。它们来自 Alpine 官方仓库的 `libstdc++` / `libgcc` 包，按 **GCC Runtime Library Exception** 许可分发；许可证说明见包内 `LICENSE-GCC-RUNTIME-LIBRARY.txt`，版本清单见 `GCC-RUNTIME-LIBRARIES.txt`。若你的系统已提供这两个库，可安全删除包内副本。
-            > The `linux-musl-*` archives ship `libstdc++.so.6` and `libgcc_s.so.1` with `RPATH=$ORIGIN` baked in, so they run immediately after extraction with no extra packages. They come from Alpine's `libstdc++` / `libgcc` packages under the **GCC Runtime Library Exception**; see `LICENSE-GCC-RUNTIME-LIBRARY.txt` and `GCC-RUNTIME-LIBRARIES.txt` in the archive. If your system already provides them, deleting the bundled copies is safe.
+            > ### 自动更新：`latest.json`
+            > 本 Release 包含 `latest.json`，内含各平台资产的绝对地址与 SHA-256。其中的 `latest_version` 由**全部 Release tag 的 SemVer 数值比较**得出，**不使用发布时间**——因为 GitHub 内置的 `releases/latest` 按发布时间选取，在「先发 v11.0、后发 v10.0」时会错误地指向 v10.0。请一律以 `latest.json` 为准：
+            > ```
+            > https://github.com/taozhiyu/ILSpy-Binaries/releases/latest/download/latest.json
+            > ```
+            > 该地址与版本无关，长期有效。以 `_` 开头的键为注释项，客户端可安全忽略。
+            > This release ships `latest.json`, which lists the absolute URL and SHA-256 of every asset. `latest_version` is resolved by **SemVer comparison across all release tags**, deliberately NOT by publication time: GitHub's own `releases/latest` ranks by publication time and would wrongly point at `v10.0` if `v11.0` were published first. Always trust `latest.json`. Keys prefixed with `_` are comments and may be ignored.
+
+            > musl 包说明 / musl packages：`ilspycmd` 的 ELF 依赖 `libstdc++.so.6` 与 `libgcc_s.so.1`（self-contained 只打包 .NET 运行时，不含GCC 运行库）。为实现解压即用，`linux-musl-*` 包内已随附这两个库，并为所有相关二进制注入了 `RPATH=$ORIGIN`。它们来自 Alpine 官方仓库的 `libstdc++` / `libgcc` 包，按 **`GPL-3.0-or-later WITH GCC-exception-3.1`** 许可分发（注意：GCC Runtime Library Exception 是叠加在 GPL 之上的附加许可，并非独立许可证）；包内 `LICENSE-GCC-RUNTIME-LIBRARY.txt` 内嵌了 GPLv3 与该例外的**完整正文**。版本清单见 `GCC-RUNTIME-LIBRARIES.txt`。若你的系统已提供这两个库，可安全删除包内副本。
+            > The `linux-musl-*` archives ship `libstdc++.so.6` and `libgcc_s.so.1` with `RPATH=$ORIGIN` baked in, so they run immediately after extraction with no extra packages. They come from Alpine's `libstdc++` / `libgcc` packages under **`GPL-3.0-or-later WITH GCC-exception-3.1`** (the GCC Runtime Library Exception is an additional permission layered on top of the GPL, not a standalone license). `LICENSE-GCC-RUNTIME-LIBRARY.txt` embeds the **complete texts** of the GPLv3 and of that exception; see `GCC-RUNTIME-LIBRARIES.txt` for the exact versions. If your system already provides them, deleting the bundled copies is safe.
           files: |
             artifacts/*.zip
             artifacts/SHA256SUMS
+
+
+      # 把 latest.json 回写到每一个正式版 Release。
+      # 这样无论用户从哪个 Release 进入，看到的都是同一份正确清单。
+      - name: 回写 latest.json 到全部 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
+          UPSTREAM_URL: ${{ needs.check-version.outputs.release_url }}
+        run: |
+          set -euo pipefail
+
+          ALL_JSON=$(curl -fsS --retry 3 --retry-all-errors \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GH_REPO}/releases?per_page=100")
+
+          TAGS=$(printf '%s' "$ALL_JSON" \
+            | jq -r '.[] | select(.draft==false and .prerelease==false) | .tag_name' \
+            | grep -E '^v?[0-9]+\.[0-9]+' | sort -u)
+
+          # 生成阶段产出的 latest.json 已存在；这里只做上传。
+          # 注意 latest.json 内容里含上游 release_url，为避免逐 Release
+          # 重新生成造成不一致，统一复用同一份文件。
+          OK=0; FAIL=0
+          while IFS= read -r t; do
+            [ -n "$t" ] || continue
+            if gh release upload "$t" latest.json \
+                 --repo "$GH_REPO" --clobber >/dev/null 2>&1; then
+              echo "已上传 latest.json -> $t"
+              OK=$((OK + 1))
+            else
+              echo "::warning::上传 latest.json 到 $t 失败"
+              FAIL=$((FAIL + 1))
+            fi
+          done <<< "$TAGS"
+
+          echo "latest.json 回写完成：成功 ${OK}，失败 ${FAIL}"
+          if [ "$OK" -eq 0 ]; then
+            echo "::error::没有任何 Release 成功接收 latest.json"
+            exit 1
+          fi

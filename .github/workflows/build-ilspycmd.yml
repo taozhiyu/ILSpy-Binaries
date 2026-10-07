@@ -938,31 +938,19 @@ jobs:
             echo "::notice::latest.json 已按 SemVer 纠正为 ${BEST_TAG}。"
           fi
 
-          # ---- 收集被选中版本的资产与校验和 ----
+          # ---- 收集被选中版本的资产 ----
           TARGET_JSON=$(printf '%s' "$ALL_JSON" | jq -c --arg t "$BEST_TAG" \
             '.[] | select(.tag_name == $t)')
           TARGET_URL=$(printf '%s' "$TARGET_JSON" | jq -r '.html_url')
 
-          # 本步骤运行在「创建本次 Release」之前，因此当 BEST_TAG 就是本次
-          # 构建的 tag 时，目标 Release 还不存在，SHA256SUMS 只能取本地
-          # artifacts/；当 BEST_TAG 是历史版本时，必须下载那一版自己的
-          # SHA256SUMS，否则会把当前版本的摘要错配给历史版本。
-          LOCAL_SUMS="$(pwd)/artifacts/SHA256SUMS"
-          if [ "$BEST_TAG" = "$CURRENT_TAG" ]; then
-            echo "latest 版本即本次构建版本，使用本地 SHA256SUMS"
-            SUMS_FILE="$LOCAL_SUMS"
-          else
-            echo "latest 版本 ${BEST_TAG} 是历史版本，下载其自身的 SHA256SUMS"
-            SUMS_FILE="$(pwd)/SHA256SUMS-${BEST_TAG}"
-            curl -fsS --retry 3 --retry-all-errors -L \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Accept: application/octet-stream" \
-              -o "$SUMS_FILE" \
-              "${SERVER_URL}/${GH_REPO}/releases/download/${BEST_TAG}/SHA256SUMS" \
-              || { echo "::error::无法获取 ${BEST_TAG} 的 SHA256SUMS"; exit 1; }
-          fi
-
-          test -s "$SUMS_FILE" || { echo "::error::SHA256SUMS 为空: $SUMS_FILE"; exit 1; }
+          # 【重要】摘要一律本地重算，不下载历史版本的 SHA256SUMS。
+          # 实测教训：SHA256SUMS 是本次新引入的文件，早于它发布的 Release（如
+          # v11.1）根本没有这个资产，去下载会得到 404 并让整个 publish 失败。
+          # 而 5 个资产 ZIP 必然存在，直接下载重算既无历史包袱也无需额外 API 调用。
+          CACHE_DIR="$(pwd)/.latest-assets/${BEST_TAG}"
+          mkdir -p "$CACHE_DIR"
+          SUMS_FILE="$CACHE_DIR/SHA256SUMS"
+          : > "$SUMS_FILE"
 
           for rid in ${RID_LIST}; do
             name="ilspycmd-${BEST_TAG}-${rid}.zip"
@@ -972,13 +960,21 @@ jobs:
               echo "::error::版本 ${BEST_TAG} 缺少资产 ${name}，无法生成 latest.json"
               exit 1
             fi
-            # 摘要也必须存在，否则 sha256 会是 null
-            if ! grep -q " ${name}\$" "$SUMS_FILE" 2>/dev/null \
-               && ! grep -q "\*${name}\$" "$SUMS_FILE" 2>/dev/null; then
-              echo "::error::SHA256SUMS 中缺少 ${name} 的摘要（来源: $SUMS_FILE）"
+            echo "下载 ${name} 以重算摘要..."
+            if ! curl -fsS --retry 3 --retry-all-errors -L \
+                 -H "Authorization: Bearer ${GH_TOKEN}" \
+                 -H "Accept: application/octet-stream" \
+                 -o "${CACHE_DIR}/${name}" \
+                 "${SERVER_URL}/${GH_REPO}/releases/download/${BEST_TAG}/${name}"; then
+              echo "::error::下载 ${name} 失败"
               exit 1
             fi
+            ( cd "$CACHE_DIR" && sha256sum "$name" >> "$SUMS_FILE" )
           done
+          cat "$SUMS_FILE"
+
+          test -s "$SUMS_FILE" || { echo "::error::SHA256SUMS 为空: $SUMS_FILE"; exit 1; }
+
 
           {
             echo "tag=$BEST_TAG"

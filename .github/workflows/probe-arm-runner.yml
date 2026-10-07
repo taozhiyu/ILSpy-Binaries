@@ -160,8 +160,11 @@ jobs:
             echo "commit=$COMMIT"
           } >> "$GITHUB_OUTPUT"
           # tag 来自上游 API / 手动输入，属于不可信内容。
-          # 按主 workflow 的约定（安全加固 4），run 脚本里不直接写 ${{ }}，
+          # 按主 workflow 的约定（安全加固 4），run 脚本里不直接写表达式插值，
           # 统一走环境变量，避免把上游字符串直接拼进 shell 源码。
+          # 注意：本注释刻意不写出插值语法本身——GitHub 的表达式解析器会扫
+          # 全文（含注释），注释里出现裸插值会让它期待闭合而报
+          # "An expression was expected"，整个 workflow 无法触发。
           echo "PROBE_TAG=$TAG" >> "$GITHUB_ENV"
           echo "PROBE_SRC_OK"
 
@@ -277,7 +280,7 @@ jobs:
           fi
           echo "项目文件: $MATCHES"
           # 【安全加固】与主 workflow 一致：统一通过环境变量传递，
-          # run 脚本里一律用 $CSPROJ，不直接写 ${{ }}（防脚本注入）。
+          # run 脚本里一律用 $CSPROJ，不直接写表达式插值（防脚本注入）。
           # 注意 CSPROJ 不带 ilspy-src/ 前缀——它会在下面两个步骤的
           # working-directory: ilspy-src 里被消费。
           echo "CSPROJ=$MATCHES" >> "$GITHUB_ENV"
@@ -766,7 +769,7 @@ jobs:
       # 既然这份汇总就是给人做切换决策看的最后一屏，就让它显示实测值：
       # 数字对不上时，人能立刻发现前面有步骤没真正生效。
       #
-      # 【注意】下面刻意用 ${{ }} ——这是全文件唯一的例外，理由充分：
+      # 【注意】下面刻意用表达式插值——这是全文件唯一的例外，理由充分：
       # 汇总步骤需要一个"若为空则说明前面被绕过"的醒目信号。
       # 若这里也改走 GITHUB_ENV（前面各步骤用 $GITHUB_OUTPUT 写），
       # 空值会静默变成空字符串并被原样渲染成人眼不易察觉的空格。

@@ -1,462 +1,248 @@
 name: Build & Release ilspycmd (self-contained)
 
 # 定时检测 icsharpcode/ILSpy 是否有新版本，如果有（或已发布但资产不全），
-
 # 就把其中的命令行工具 ilspycmd 编译成 self-contained（自带 .NET 运行时，
-
 # 目标机器无需安装 dotnet SDK/Runtime）的以下 5 个平台包，并发布到本仓库
-
 # 的 Release：
-
 #   linux-arm64 / linux-musl-arm64 / linux-musl-x64 / linux-x64 / win-x64
-
 #
-
 # Periodically checks icsharpcode/ILSpy for a new version. If found (or an
-
 # existing release is missing assets), builds ilspycmd as a self-contained
-
 # (bundled .NET runtime, no SDK/Runtime needed on the target machine)
-
 # package for the 5 platforms above and publishes them to this repo's
-
 # Releases.
-
 #
-
 # ---------------------------------------------------------------------------
-
 # 构建配方说明（重要，改动前请先读完）
-
 #
-
 # 本仓库只做一件事：把上游第三方源码编译成二进制。因此“构建配方”必须
-
 # 严格限定在“已被 CI 实际验证过”的那条路径上，不要根据推理去优化它。
-
 #
-
 # 已知事实（全部来自 GitHub Actions 真实运行日志，不是推断）：
-
 #
-
 #   * run 35939929413（commit 6777f6a）= 唯一一次 5 个 RID 全部构建成功。
-
 #     它的配方是：
-
 #       - setup-dotnet 安装 8.0.x / 9.0.x / 10.0.x / 11.0.x 四套 SDK
-
 #       - 删除 global.json 里的 .sdk 段（保留 test 等其它段）
-
 #       - 单次 dotnet restore（-r <rid>，RestoreLockedMode=false）
-
 #       - dotnet publish --no-restore
-
 #
-
 #   * 从 7c2158b 起，配方被“改进”为：只装global.json 推导出的那一个
-
 #     SDK channel、不再删除 global.json 的 .sdk、restore 先尝试 locked
-
 #     模式再回退。此后每一次 CI 运行都是 5/5 失败。
-
 #     失败形态固定为：
-
 #       Failed to restore .../ICSharpCode.Decompiler.Generators.csproj (in 1~233 ms).
-
 #       .../NuGet.targets(198,5): error MSB4181:
-
 #         The "RestoreTask" task returned false but did not log an error.
-
 #     关键细节：0 Warning(s)、0 个 NUxxxx 错误码、还原其实已完成
-
 #     （RestoreProjectsAuditedCount=1），只有 netstandard2.0 的
-
 #     ICSharpCode.Decompiler.Generators（Roslyn 源生成器）被拖垮，
-
 #     MSBuild 把图级失败归到了顶层 ICSharpCode.ILSpyCmd 上。
-
 #
-
 #   * 已排除的因素（都实测/查证过，不要再往这些方向猜）：
-
 #       - RID 单数 RuntimeIdentifier vs 复数 RuntimeIdentifiers
-
 #       - 上游 packages.lock.json 与 NU1004（locked 模式失败是预期的，
-
 #         原本就有回退分支，不是本次故障原因）
-
 #       - NuGet 漏洞审计（NuGetAudit=false 之后 CI 依旧失败）
-
 #   * 已排除的因素（都实测/查证过，不要再往这些方向猜）：
-
 #       - RID 单数 RuntimeIdentifier vs 复数 RuntimeIdentifiers
-
 #       - 上游 packages.lock.json 与 NU1004（locked 模式失败是预期的，
-
 #         原本就有回退分支，不是本次故障原因）
-
 #       - NuGet 漏洞审计（NuGetAudit=false 之后 CI 依旧失败）
-
 #       - SDK 是否为预览版（换到 GA 10.0.401 依旧失败）
-
 #       - 缓存冷热（冷缓存下本地也能通过）
-
 #       - TreatWarningsAsErrors=true（实测 true / false 都5/5 成功）
-
 #       - 是否并发（单 job 与 5 job 并发都 5/5 成功）
-
 #       - 变量传递方式（GITHUB_ENV 与 GITHUB_OUTPUT 均成功）
-
 #
-
 #   => 真正的根因：build job 把上游 tag 通过环境变量 VERSION 传入。
-
 #      MSBuild 会把同名环境变量当作保留属性 $(Version) 注入所有项目，
-
 #      而 $(Version) 是 VersionPrefix / VersionSuffix / PackageVersion
-
 #      的派生源。上游 tag 形如 "v11.0" 并非合法 SemVer，注入后
-
 #      ICSharpCode.Decompiler.Generators（唯一使用默认版本逻辑的
-
 #      netstandard2.0 项目）的 NuGet 版本解析失败，且被 NuGet 吞掉，
-
 #      只留下 MSB4181 这条无信息量的错误。
-
 #
-
 #      实测证据（diag13，同一 commit、同一 SDK，各 5 次还原）：
-
 #        不设 VERSION         -> 5/5 成功
-
 #        仅设 COMMIT          -> 5/5 成功
-
 #        仅设 VERSION=v11.0   -> 0/5 全部失败
-
 #
-
 #      => 修复：变量改名为 RELEASE_TAG。构建配方本身无需改动，
-
 #         6777f6a 的配方是正确的，之前一直失败是环境变量名撞上了
-
 #         MSBuild 保留属性。
-
 #
-
 #      注意：本workflow 的 env 变量名不要使用 VERSION / Version /
-
 #      PackageVersion 等MSBuild 保留名，否则会重现同一故障。
-
 # ---------------------------------------------------------------------------
 
 on:
 
   schedule:
-
-    # UTC 时间每天 03:00 检测一次（北京时间 11:00），可按需修改 cron 表达式
-
     - cron: '0 3 * * *'
-
   workflow_dispatch:
-
     inputs:
-
       force_version:
-
         description: '强制指定要构建的 ILSpy 版本 tag（例如 v11.0-rc），留空则自动检测上游最新正式版'
-
         required: false
-
         default: ''
-
       include_prerelease:
-
         description: '自动检测时是否包含预发布版本（rc / preview）'
-
         type: boolean
-
         default: false
-
 # ===========================================================================
-
 # 安全加固 1：权限最小化
-
 #   全局只读；只有 publish job 显式声明 contents: write。
-
 #   build job 会执行第三方源码（MSBuild / NuGet / 源生成器），
-
 #   它绝不能持有写权限。
-
 # ===========================================================================
 
 permissions:
 
   contents: read
-
 # ===========================================================================
-
 # 安全加固 2：并发锁
-
 #   防止“每日定时”与“手动触发”同时操作同一个 Release。
-
 #   cancel-in-progress 必须为 false：发布到一半被取消会留下半成品。
-
 # ===========================================================================
 
 concurrency:
 
   group: ilspycmd-release
-
   cancel-in-progress: false
 
 env:
 
   UPSTREAM_REPO: icsharpcode/ILSpy
-
-  # 5 个平台包的 RID 列表，check-version / build / publish 共用同一份定义
-
   RID_LIST: "linux-arm64 linux-musl-arm64 linux-musl-x64 linux-x64 win-x64"
 
 jobs:
 
   # ---------------------------------------------------------------------
-
   # 第 1 步：检测上游版本 -> 解析 commit SHA -> 校验本仓库资产是否齐全
-
   # ---------------------------------------------------------------------
-
   check-version:
-
     runs-on: ubuntu-24.04
-
     permissions:
-
       contents: read
-
     outputs:
-
       version: ${{ steps.detect.outputs.version }}
-
       commit: ${{ steps.detect.outputs.commit }}
-
       should_build: ${{ steps.detect.outputs.should_build }}
-
       prerelease: ${{ steps.detect.outputs.prerelease }}
-
       release_url: ${{ steps.detect.outputs.release_url }}
-
     steps:
 
       - name: 检测上游版本并校验本仓库资产完整性
 
         id: detect
-
         env:
-
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
           GH_REPO: ${{ github.repository }}
-
           FORCE_VERSION: ${{ github.event.inputs.force_version }}
-
           INCLUDE_PRE: ${{ github.event.inputs.include_prerelease }}
-
         run: |
-
           set -euo pipefail
-
           # API 调用统一封装：HTTP 错误直接失败（-f）、网络抖动自动重试，
-
           # 避免 403/429/5xx 被吞掉后只留下难懂的 "null"
-
           gh_api() {
-
             curl -fsS --retry 3 --retry-all-errors \
               --connect-timeout 10 --max-time 60 \
               -H "Authorization: Bearer ${GH_TOKEN}" \
               -H "Accept: application/vnd.github+json" \
               "$1"
-
           }
-
           # ---- A.确定要构建的 tag ----
-
           if [ -n "${FORCE_VERSION:-}" ]; then
-
             # 手动输入先做白名单校验，杜绝把脚本内容带进下游
-
             if ! printf '%s' "$FORCE_VERSION" | grep -Eq '^[A-Za-z0-9._+-]+$'; then
-
               echo "force_version 含有非法字符: $FORCE_VERSION" >&2
-
               exit 1
-
             fi
-
             TAG="$FORCE_VERSION"
-
             echo "手动指定版本: $TAG"
-
             RELEASE_JSON=$(gh_api "https://api.github.com/repos/${UPSTREAM_REPO}/releases/tags/${TAG}")
-
           else
-
             if [ "${INCLUDE_PRE:-false}" = "true" ]; then
-
               # 只排除 draft，其余（含 prerelease）按发布时间倒序取第一个
-
               RELEASE_JSON=$(gh_api "https://api.github.com/repos/${UPSTREAM_REPO}/releases?per_page=100" \
                 | jq '[.[] | select(.draft==false)] | sort_by(.published_at) | reverse | .[0]')
-
             else
-
               # /releases/latest 的官方语义：最新的非 draft、非 prerelease
-
               RELEASE_JSON=$(gh_api "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest")
-
             fi
-
           fi
-
           TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
-
           PRERELEASE=$(echo "$RELEASE_JSON" | jq -r '.prerelease')
-
           RELEASE_URL=$(echo "$RELEASE_JSON" | jq -r '.html_url')
-
           echo "上游版本: $TAG (prerelease=$PRERELEASE)"
-
           if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
-
             echo "未能获取到上游版本号" >&2
-
             exit 1
-
           fi
-
           # ---- B. tag -> commit SHA ----
-
           # 安全加固 3：消除 tag -> commit 的 TOCTOU。
-
           # build阶段按 SHA 检出，保证“检测到的”和“构建的”是同一份源码。
-
           REF_JSON=$(gh_api "https://api.github.com/repos/${UPSTREAM_REPO}/git/refs/tags/${TAG}")
-
           OBJ_TYPE=$(echo "$REF_JSON" | jq -r '.object.type // empty')
-
           OBJ_SHA=$(echo "$REF_JSON" | jq -r '.object.sha // empty')
-
           if [ -z "$OBJ_SHA" ]; then
-
             echo "无法解析 tag ${TAG} 对应的 commit" >&2
-
             exit 1
-
           fi
-
           if [ "$OBJ_TYPE" = "tag" ]; then
-
             # annotated tag：再解一层拿到真正指向的 commit
-
             TAG_JSON=$(gh_api "https://api.github.com/repos/${UPSTREAM_REPO}/git/tags/${OBJ_SHA}")
-
             COMMIT_SHA=$(echo "$TAG_JSON" | jq -r '.object.sha')
-
           else
-
             COMMIT_SHA="$OBJ_SHA"
-
           fi
-
           echo "tag ${TAG} -> commit ${COMMIT_SHA}"
-
           # ---- C. 校验本仓库该版本的 5 个资产是否齐全 ----
-
           # 只判断 Release 存在是不够的：某次构建部分失败后会永久跳过
-
           SHOULD_BUILD=true
-
           if gh release view "$TAG" --repo "$GH_REPO" --json assets \
               > /tmp/existing-release.json 2>/dev/null; then
-
             MISSING=false
-
             for rid in ${RID_LIST}; do
-
               NAME="ilspycmd-${TAG}-${rid}.zip"
-
               if ! jq -e --arg n "$NAME" '.assets[]? | select(.name == $n)' \
                   /tmp/existing-release.json > /dev/null; then
-
                 echo "缺少资产: $NAME"
-
                 MISSING=true
-
               fi
-
             done
-
             if [ "$MISSING" = "false" ]; then
-
               echo "本仓库 release ${TAG} 已存在且 5 个资产齐全，跳过构建"
-
               SHOULD_BUILD=false
-
             else
-
               echo "本仓库 release ${TAG} 存在但资产不全，重新构建补齐"
-
             fi
-
           fi
-
           {
-
             echo "version=$TAG"
-
             echo "commit=$COMMIT_SHA"
-
             echo "should_build=$SHOULD_BUILD"
-
             echo "prerelease=$PRERELEASE"
-
             echo "release_url=$RELEASE_URL"
-
           } >> "$GITHUB_OUTPUT"
-
   # ---------------------------------------------------------------------
-
   # 第 2 步：按 5 个 RID 并行构建 self-contained 包
-
   #   dotnet publish --self-contained 本身是跨平台发布，全部放在Linux
-
   #   runner 上即可，不需要 Windows / ARM 机器。
-
   #   任意一个 RID 失败 -> build job 整体失败 -> publish 不会运行，
-
   #   天然实现“5 个全部成功才发布”。
-
   # ---------------------------------------------------------------------
-
   build:
-
     needs: check-version
-
     if: needs.check-version.outputs.should_build == 'true'
-
     # win-x64 -> windows-latest（原生 Windows）；其余 4 个 linux RID -> ubuntu-24.04。
     # 映射由上面 matrix.include 决定。
     runs-on: ${{ matrix.os }}
-
     permissions:
-
       contents: read
-
     strategy:
-
       fail-fast: false
-
       matrix:
 
         # 用 include 显式列出 rid-> os 映射，而不是 `rid` x `os` 笛卡尔积：
@@ -468,170 +254,94 @@ jobs:
         # .NET self-contained PE 的支持并不完整，且已为此绕过两轮
         #（先把 wine 改成 wine64，再修 wine64 的安装路径）。
         include:
-
           - rid: linux-x64
             os: ubuntu-24.04
-
           - rid: linux-arm64
             os: ubuntu-24.04
-
           - rid: linux-musl-x64
             os: ubuntu-24.04
-
           - rid: linux-musl-arm64
             os: ubuntu-24.04-arm
-
           - rid: win-x64
             os: windows-latest
-
     # 安全加固 4：统一通过环境变量传递，脚本里一律用 $RELEASE_TAG/$RID，
-
     # 不在 run 脚本里直接写 ${{ }}（防脚本注入）
-
     #
-
     # 【关键】版本号变量必须叫 RELEASE_TAG，绝不能叫 VERSION：
-
     # MSBuild 会把同名环境变量当作保留属性 $(Version) 注入所有项目，
-
     # 而 $(Version) 是 VersionPrefix / VersionSuffix / PackageVersion 的
-
     # 派生源。上游 tag 形如 "v11.0" 并非合法 SemVer，一旦注入就会让
-
     # ICSharpCode.Decompiler.Generators（唯一使用默认版本逻辑的
-
     # netstandard2.0 项目）NuGet 版本解析失败，且失败形态是无任何
-
     # 错误码的 MSB4181，极难定位。
-
     # 已实测确认（diag13，同一 commit/同一 SDK，各5 次还原）：
-
     #   不设 VERSION        -> 5/5 成功
-
     #   仅设 COMMIT         -> 5/5 成功
-
     #   仅设 VERSION=v11.0  -> 0/5 全部失败
-
     env:
-
       RELEASE_TAG: ${{ needs.check-version.outputs.version }}
-
       COMMIT: ${{ needs.check-version.outputs.commit }}
-
       RID: ${{ matrix.rid }}
-
     steps:
 
       - name: 检出 ILSpy 源码（按 commit SHA，不保留凭据）
 
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
         with:
-
           repository: icsharpcode/ILSpy
-
           ref: ${{ needs.check-version.outputs.commit }}
-
           submodules: false          # 构建 ilspycmd 用不到 ILSpy-Tests 子模块
-
           persist-credentials: false # 安全加固 5：第三方代码不应接触 git 凭据
-
           path: ilspy-src
-
       # 只为本仓库的说明文档与许可证正文做额外一次稀疏检出：它们要随包分发，
-
       # 让使用者不打开浏览器也能看到说明、免责声明与完整许可文本。
-
       # 用 sparse-checkout 只取这些文件，不下载本仓库其余内容。
-
       # ref 用触发本次构建的分支/提交，保证包内文档与构建来源一致。
 
       - name: 检出本仓库说明文档与许可证正文
 
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
         with:
-
           sparse-checkout: |
-
             README.md
-
             README.zh.md
-
             licenses/
-
           sparse-checkout-cone-mode: false
-
           persist-credentials: false
-
           path: repo-docs
-
       # =================================================================
-
       # 构建配方（已用真实 CI 运行验证）
-
       #
-
       # 故障形态（从 7c2158b 起每次运行必现，5/5 全挂）：
-
       #   Failed to restore .../ICSharpCode.Decompiler.Generators.csproj
-
       #       (in 0.7~233 ms)
-
       #   NuGet.targets(200,5): error MSB4181:
-
       #     The "RestoreTask" task returned false but did not log an error.
-
       #
-
       # 特征：0 Warning(s)、0 个 NUxxxx 错误码、还原其实已完成
-
       #（RestoreProjectsAuditedCount=1），只有 netstandard2.0 的
-
       # ICSharpCode.Decompiler.Generators（Roslyn 源生成器）被拖垮，
-
       # MSBuild 再把图级失败归到顶层 ICSharpCode.ILSpyCmd 上。
-
       #
-
       # 已用受控实验排除的因素（不要再往这些方向猜）：
-
       #   - RID 单数 RuntimeIdentifier vs 复数 RuntimeIdentifiers
-
       #   - 上游 packages.lock.json / NU1004
-
       #   - NuGet 漏洞审计（NuGetAudit=false 后依旧失败）
-
       #   - SDK 是否预览版（换GA 10.0.401依旧失败）
-
       #   - 是否 4 套 SDK / 是否删global.json 的 .sdk
-
       #   - NuGet 缓存冷热、代理、nuget.org 连通性（均正常）
-
       #
-
       # 关键结论：这是**非确定性故障（flake）**。同一 commit、同一 SDK、
-
       # 逐字相同的 restore 命令，在 diag2/diag3/diag5 中连续 EXIT=0，
-
       # 在 diag4 中连续 3 次 EXIT=1；同一 workflow 里 5 个并发 job
-
       # 也时好时坏。因此不能靠“换配方”解决，只能靠重试。
-
       #
-
       # 保留 6777f6a 的配方（4 套 SDK + 删 global.json 的 .sdk +
-
       # 单次 restore），并给 restore 加重试：失败时清掉 obj/ 与
-
       # NuGet 缓存再试。这是对抗 flake 的正确手段。
-
       # -------------------------------------------------------------------
-
       # 不使用 setup-dotnet 的 global-json-file 解析：上游 global.json 的
-
       # sdk.version 写作 "11.0.0"（非完整版本号）且带 rollForward，
-
       # setup-dotnet 与 dotnet CLI 的严格校验会直接报错。
 
       # ---------------------------------------------------------------------
@@ -650,28 +360,20 @@ jobs:
       - name: Windows 腿工具预检
 
         if: runner.os == 'Windows'
-
         shell: bash
-
         run: |
-
           set -uo pipefail
-
           MISSING=""
-
           if ! command -v jq >/dev/null 2>&1; then
             MISSING="${MISSING} jq"
           fi
-
           if ! command -v dotnet >/dev/null 2>&1; then
             MISSING="${MISSING} dotnet"
           fi
-
           if [ -n "${MISSING}" ]; then
             echo "::error title=环境不支持::Windows runner 缺少必需工具: ${MISSING}。windows-latest 镜像应自带这些工具；若缺失说明镜像被裁剪，需换runner 镜像。"
             exit 1
           fi
-
           echo "jq: $(command -v jq)"
           echo "dotnet: $(command -v dotnet)"
           echo "dotnet --version: $(dotnet --version 2>/dev/null || echo '<读不到>')"
@@ -681,52 +383,31 @@ jobs:
       - name: 清理 global.json 里的 SDK 版本锁定
 
         working-directory: ilspy-src
-
         shell: bash
         run: |
-
           set -euo pipefail
-
           if [ -f global.json ]; then
-
             echo "补丁前:"
-
             cat global.json
-
             # 只删 .sdk，保留 msbuild-sdks / test 等其它段
-
             jq 'del(.sdk)' global.json > global.json.tmp && mv global.json.tmp global.json
-
             echo "补丁后:"
-
             cat global.json
-
           else
-
             echo "未找到 global.json，跳过"
-
           fi
 
       - name: 安装 .NET SDK（四套，冻结配方）
 
         uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6
-
         with:
-
           dotnet-version: |
-
             8.0.x
-
             9.0.x
-
             10.0.x
-
             11.0.x
-
           dotnet-quality: 'preview'   # 8/9/10 已 GA，实际仍会装到各自最新
-
                                        # 正式版；11.0.x 目前是 preview，需要
-
                                        # 这个开关才能装上
 
           # ---- NuGet 包缓存（官方内置，见下方说明）----
@@ -735,7 +416,6 @@ jobs:
           # 失效  : 由 cache-dependency-path 指向的文件内容哈希决定；
           #         上游 csproj / packages.lock.json 变化即自动失效
           cache: true
-
           # 依赖清单：上游所有 csproj + lock 文件。
           # 哈希基于这些文件内容，上游一动就换key，不会拿到过期依赖。
           cache-dependency-path: |
@@ -767,26 +447,16 @@ jobs:
       - name: 定位 ilspycmd 项目文件
 
         working-directory: ilspy-src
-
         shell: bash
         run: |
-
           set -euo pipefail
-
           # 不写死路径（上游曾把目录从ICSharpCode.Decompiler.Console
-
           # 改名为 ICSharpCode.ILSpyCmd），按 ToolCommandName 特征搜索。
-
           # 安全加固 6：0 个或多个候选都直接失败，不再随便取第一个。
-
           MATCHES=$(grep -rl "<ToolCommandName>ilspycmd" --include="*.csproj" . || true)
-
           COUNT=$(printf '%s\n' "$MATCHES" | grep -c . || true)
-
           if [ "$COUNT" -eq 0 ]; then
-
             echo "未找到 ilspycmd 项目文件" >&2
-
             exit 1
 
           fi
@@ -796,128 +466,73 @@ jobs:
             echo "找到多个候选项目文件，无法自动确定，请人工检查：" >&2
 
             printf '%s\n' "$MATCHES" >&2
-
             exit 1
-
           fi
-
           echo "找到项目文件: $MATCHES"
-
           echo "CSPROJ=$MATCHES" >> "$GITHUB_ENV"
-
       # 还原。刻意不做“先试 locked 模式再回退”的两段式：
-
       # 上游 csproj 硬编码了 <RestoreLockedMode>true</RestoreLockedMode>，
-
       # 而 lock 文件的 RID 段固定为 win-x64;win-arm64;linux-x64;osx-arm64，
-
       # 传入单个 RID 时必然 NU1004——这是预期内的，所以直接关闭锁定模式，
-
       # 不去跑那条注定失败、且会污染 obj/ 中间状态的试探分支。
-
       #
-
       # -p:RestoreEnablePackagePruning=false 与上游官方构建脚本一致。
-
       #
-
       # 真正的根因（13 组受控实验定位，勿再改动上方 env 里的变量名）：
-
       #   build job 把上游 tag 通过环境变量 VERSION 传进来，
-
       #   而 MSBuild 会把同名环境变量当作保留属性 $(Version) 注入项目。
-
       #   $(Version) 是 VersionPrefix / VersionSuffix / PackageVersion 的
-
       #   派生源；上游 tag 形如 "v11.0" 不是合法 SemVer，注入后
-
       #   ICSharpCode.Decompiler.Generators（唯一使用默认版本逻辑的
-
       #   netstandard2.0 项目）的 NuGet 版本解析失败，且被NuGet 吞掉，
-
       #   只留下 MSB4181 这条无信息量的错误。
-
       #   已修：变量改名 RELEASE_TAG（见上方 env 定义）。
-
       #
-
       # 下面仍保留重试作为兜底：万一将来上游再引入同类变量名冲突，
-
       # 或NuGet 出现别的偶发问题，workflow 不会直接卡死。
 
       - name: Restore（失败自动重试）
 
         working-directory: ilspy-src
-
         shell: bash
         run: |
-
           set -uo pipefail
-
           MAX_ATTEMPTS=6
-
           ATTEMPT=1
-
           while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
-
             echo "=====还原尝试 $ATTEMPT / $MAX_ATTEMPTS ====="
-
             if dotnet restore "$CSPROJ" \
                 -r "$RID" \
                 -p:RestoreLockedMode=false \
                 -p:RestoreEnablePackagePruning=false; then
-
               echo "还原成功（第 $ATTEMPT 次尝试）"
-
               exit 0
-
             fi
-
             echo "::warning::第 $ATTEMPT 次还原失败（Generators 的 MSB4181 偶发故障）"
-
             if [ "$ATTEMPT" -eq "$MAX_ATTEMPTS" ]; then
-
               echo "::error::还原重试 $MAX_ATTEMPTS 次仍失败"
-
               echo "::group::最后一次失败的相关项目状态"
-
               find . -type d -name obj -prune -exec ls -la {} + 2>/dev/null | head -40 || true
-
               echo "::endgroup::"
-
               exit 1
-
             fi
-
             # 彻底清理：obj/ + NuGet http 缓存 + 全局包缓存
-
             find . -type d -name obj -prune -exec rm -rf {} + 2>/dev/null || true
-
             dotnet nuget locals http-cache --clear 2>/dev/null || true
-
             dotnet nuget locals global-packages --clear 2>/dev/null || true
-
             ATTEMPT=$((ATTEMPT + 1))
-
             sleep $((ATTEMPT * 5))
-
           done
-
           exit 1
-
       # -p:DebugType=none -p:DebugSymbols=false：从源头不生成托管 .pdb，
-
       # 比发布后再删更干净（不会有编译器先写盘、再被删除的浪费）
 
       - name: Publish self-contained
 
         working-directory: ilspy-src
-
         shell: bash
         run: |
-
           set -euo pipefail
-
           dotnet publish "$CSPROJ" \
             -c Release \
             -r "$RID" \
@@ -927,164 +542,96 @@ jobs:
             -p:DebugType=none \
             -p:DebugSymbols=false \
             -o "../out/${RID}"
-
       # 清理发布产物里编译参数关不掉的"垃圾"：
-
       #   *.dbg        —— Linux 下 native 运行时组件的独立调试符号，通常是体积大头
-
       #   createdump   —— Linux/macOS 下用于生成崩溃 core dump 的小工具，CLI 用不上
-
       #   *.pdb        —— 以防个别第三方依赖仍带着预编译好的 pdb 被复制进来
-
       #   *.xml        —— API 文档注释（IntelliSense 用），压缩包里没意义
-
       # 清理前后都打印体积，方便核对到底删了多少
 
       - name: 清理调试符号与无用文件
 
         shell: bash
         run: |
-
           set -euo pipefail
-
           OUT_DIR="out/${RID}"
-
           echo "清理前体积:"
-
           du -sh "$OUT_DIR"
-
           echo "将要删除的文件："
-
           find "$OUT_DIR" -type f \( \
               -name "*.dbg" -o \
               -name "*.pdb" -o \
               -name "*.xml" -o \
               -name "createdump" \
             \) -print
-
           find "$OUT_DIR" -type f \( \
               -name "*.dbg" -o \
               -name "*.pdb" -o \
               -name "*.xml" -o \
               -name "createdump" \
             \) -delete
-
           echo "清理后体积:"
-
           du -sh "$OUT_DIR"
-
       # ---------------------------------------------------------------------
-
       # 随包分发文档：上游许可 + 上游说明 + 本仓库中英文 README + 构建信息
-
       #
-
       # 分发二进制时，除了代码许可，还应让使用者能在包内看到：
-
       #   - 上游 ILSpy 的许可证（MIT）
-
       #   - 上游维护的第三方组件声明（doc/third-party-notices.txt）
-
       #   - 上游 ilspycmd 自己的使用说明（来自上游仓库的 README.md）
-
       #   - 本仓库的说明（中英双语），含免责声明与 musl 依赖说明
-
       #   - 本次构建的来源信息（tag / commit / SDK / 构建时间），
-
       #     便于使用者追溯这个二进制到底由哪份源码构建而来
-
       #
-
       # 注意：ilspycmd 的 csproj 里有 <None Include="README.md" Pack="true" />，
-
       # 那是给 NuGet 包用的，self-contained publish 不会把它复制到输出目录，
-
       # 因此这里显式复制，并重命名为 README-UPSTREAM.md 以免与本仓库
-
       # 的 README.md 混淆。
-
       #
-
       # 【合规要点】MIT 只要求"随副本附带版权声明"，因此上游 LICENSE 足够。
-
       # 但 ilspycmd 依赖 NuGet.Protocol / McMaster.Extensions.Hosting.CommandLine
-
       # 等 Apache-2.0 组件，Apache-2.0 第 4 条要求保留 NOTICE/归属声明，
-
       # 因此必须把上游的 doc/third-party-notices.txt 一并打包。
-
       # ---------------------------------------------------------------------
 
       - name: 随包分发许可与说明文档
 
         shell: bash
         run: |
-
           set -euo pipefail
-
           OUT_DIR="out/${RID}"
-
           DOCS=0
-
           # ---- 1) 上游许可 ----
-
           # 上游文件名就是 LICENSE（无扩展名）。实测 LICENSE.txt / LICENSE.md
-
           # 在上游均返回 404，不要凭直觉枚举后缀。
-
           for f in LICENSE LICENSE.txt LICENSE.md COPYING COPYING.txt; do
-
             if [ -f "ilspy-src/$f" ]; then
-
               cp "ilspy-src/$f" "$OUT_DIR/"
-
               echo "已复制上游 $f"
-
               DOCS=$((DOCS + 1))
-
             fi
-
           done
-
           # ---- 1b) 上游第三方组件声明（在 doc/ 子目录，不在仓库根）----
-
           # 上游结构实测：doc/third-party-notices.txt、doc/copyright.txt
-
           for f in doc/third-party-notices.txt doc/copyright.txt \
                    doc/license.txt doc/LICENSE.txt; do
-
             if [ -f "ilspy-src/$f" ]; then
-
               cp "ilspy-src/$f" "$OUT_DIR/"
-
               echo "已复制上游 $f"
-
               DOCS=$((DOCS + 1))
-
             fi
-
           done
-
           # ---- 2) 上游 ilspycmd 的使用说明 ----
-
           UPSTREAM_README=""
-
           for cand in \
               "ilspy-src/ICSharpCode.ILSpyCmd/README.md" \
               "$(dirname "$CSPROJ")/README.md"; do
-
             if [ -f "$cand" ]; then
-
               UPSTREAM_README="$cand"
-
               break
-
             fi
-
           done
-
           if [ -n "$UPSTREAM_README" ]; then
-
             cp "$UPSTREAM_README" "$OUT_DIR/README-UPSTREAM.md"
 
             echo "已复制上游说明文档: $UPSTREAM_README -> README-UPSTREAM.md"
@@ -1100,167 +647,86 @@ jobs:
           # ---- 3) 本仓库说明（中英双语）----
 
           # 来自上方稀疏检出，取的是触发本次构建的分支版本，
-
           # 保证包内文档与构建来源一致。
-
           for f in README.md README.zh.md; do
-
             if [ -f "repo-docs/$f" ]; then
-
               cp "repo-docs/$f" "$OUT_DIR/$f"
-
               echo "已复制本仓库 $f"
-
               DOCS=$((DOCS + 1))
-
             else
-
               echo "::warning::未找到 repo-docs/$f，无法随包分发"
-
             fi
-
           done
-
           # ---- 4) 构建来源信息 ----
-
           {
-
             echo "ilspycmd self-contained build"
-
             echo "================================"
-
             echo "Upstream project : ${UPSTREAM_REPO}"
-
             echo "Upstream tag     : ${RELEASE_TAG}"
-
             echo "Upstream commit  : ${COMMIT}"
-
             echo "Target RID       : ${RID}"
-
             echo "Build run        : ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-
             echo "Build date (UTC) : $(date -u '+%Y-%m-%d %H:%M:%S')"
-
             echo "Build SDKs       : 8.0.x 9.0.x 10.0.x 11.0.x (channel), selected by dotnet at build time"
-
             echo "dotnet --version : $(cd ilspy-src && dotnet --version 2>/dev/null || echo 'n/a')"
-
             echo
-
             echo "This build was produced automatically by GitHub Actions."
-
             echo "It is NOT an official ILSpy release and is not affiliated"
-
             echo "with or endorsed by the ILSpy project or its maintainers."
-
             echo "Source code and official releases: https://github.com/icsharpcode/ILSpy"
-
           } > "$OUT_DIR/BUILD-INFO.txt"
-
           echo "已生成 BUILD-INFO.txt"
-
           DOCS=$((DOCS + 1))
-
           echo "共随包分发 $DOCS 份文档/许可文件"
-
           ls -la "$OUT_DIR" | grep -iE "LICENSE|NOTICE|README|BUILD-INFO"
-
       # ---------------------------------------------------------------------
-
       # musl（Alpine）包补齐 GCC 运行库依赖
-
       #
-
       # 背景：ilspycmd 的 ELF 里有两条 NEEDED 依赖：
-
       #   NEEDED  libstdc++.so.6
-
       #   NEEDED  libgcc_s.so.1
-
       # self-contained 只打包 .NET 运行时，不含这两个 GCC 运行库。
-
       # 纯净 Alpine 默认也不带它们，于是用户解压后直接运行会报
-
       #   Error loading shared library libstdc++.so.6
-
       #
-
       # 实测结论（diag14/diag15，纯 Alpine 容器内验证）：
-
       #   P1 纯净 Alpine 直接运行                -> 失败
-
       #   P2 把库放进同目录，不设LD_LIBRARY_PATH -> 仍然失败
-
       #      （musl loader 只按 ld-musl-*.path + 默认目录搜索，
-
       #        不会搜索程序所在目录）
-
       #   P3 同目录 + LD_LIBRARY_PATH            -> 成功
-
       #   W1 给所有依赖方注入 RPATH='$ORIGIN'     -> 成功，且用户
-
       #      解压后可直接 ./ilspycmd，无需任何环境变量
-
       #
-
       # 因此采用 RPATH 方案：把 libstdc++/libgcc_s 随包分发，
-
       # 并给主程序及所有依赖它们的 .so 注入 RPATH=$ORIGIN。
-
       #
-
       # 体积代价：libstdc++.so.6.0.34约 2.7MB + libgcc_s.so.1 约 170KB
-
       # 许可：GCC Runtime Library Exception（随 GCC 分发，允许再分发）
-
       # ---------------------------------------------------------------------
-
       # qemu-user 模拟支持（仅 linux-arm64）
-
       #
-
       # 为什么需要：linux-arm64（glibc）的产物是 aarch64 ELF，但它的 matrix
-
       # runner 仍是 x86_64（ubuntu-24.04），因此真机验证必须靠 qemu-user 提供
-
       # aarch64 用户态——具体是 debian:bookworm 的 arm64 镜像（glibc 产物不能
-
       # 用 musl 的 Alpine 承载，且 .NET 的加密/证书依赖需要镜像里的 libssl3）。
-
       #
-
       # 【为什么 linux-musl-arm64 已不再走这条路】
-
       # linux-musl-arm64 已切到**原生 aarch64 runner**（ubuntu-24.04-arm，见
-
       # matrix.include）。宿主本身就是 aarch64，于是两件依赖 aarch64 用户态的
-
       # 事都不再需要 binfmt 注册：从 Alpine 取到的库天然是 aarch64，冒烟测试
-
       # 也天然能执行 arm64 ELF。宿主侧只需一条 uname -m 断言来证明这一点
-
       # （见真机验证步骤的 musl-arm64 分支）。
-
       # 实测收益：该腿 493s -> 约 77s，其中模拟开销 416s -> 2s。
-
       #
-
       # 历史缺陷（本次修复的根因）：此前取库的 docker run 没有 --platform，
-
       # apk 在 x86_64 上执行，拿到的是 **x86_64** 的 .so，却被原样 cp 进
-
       # linux-musl-arm64 产物目录，再给所有 ELF 注入 RPATH=$ORIGIN。
-
       # 目标机（麒麟 arm64）优先加载了这两个错架构 .so，其重定位表无法被
-
       # aarch64 loader 解释，运行时报
-
       #   Error relocating ...: unsupported relocation type 1
-
       #   Error relocating ...: unsupported relocation type 6
-
       # （x86-64 的 R_X86_64_64=1、R_X86_64_GLOB_DAT=6 在 aarch64 下是
-
       #   未定义编号，aarch64 的动态重定位从 257 起编）
 
       # 于是解包 Database 阶段返回非 0 状态码，stderr 刷出约 28 万行。
@@ -1268,11 +734,8 @@ jobs:
       # 现在由「按 RID 显式 --platform」+「readelf 架构断言」双重保证。
 
       #
-
       # 只装 arm64：默认的 platforms: all 会额外拉取并注册 arm、ppc、
-
       # s390x、riscv64 等一堆用不到的处理器，显著拖慢每个 matrix job。
-
       # ---------------------------------------------------------------------
 
       - name: 启用 qemu-user 模拟（仅 linux-arm64）
@@ -1318,10 +781,8 @@ jobs:
       - name: 探测 arm64 模拟可用性（仅 linux-arm64）
 
         if: always() && matrix.rid == 'linux-arm64'
-
         run: |
           set -uo pipefail
-
           # ---- 静态检查（仅诊断，不作为判据）----
           if command -v qemu-aarch64-static >/dev/null 2>&1; then
             echo "qemu-aarch64-static: $(command -v qemu-aarch64-static)"
@@ -1330,7 +791,6 @@ jobs:
           else
             echo "qemu-aarch64-static: 未找到（不作为失败判据，binfmt 注册不一定留下该文件）"
           fi
-
           # ---- 真实 canary（唯一判据）----
           CANARY_LOG=/tmp/qemu-canary.log
           CANARY_OUT=""
@@ -1338,10 +798,8 @@ jobs:
           CANARY_OUT=$(docker run --rm --platform linux/arm64 alpine:3 \
             /bin/sh -c 'uname -m' 2>"${CANARY_LOG}") || CANARY_RC=$?
           CANARY_ARCH=$(printf '%s' "${CANARY_OUT}" | tr -d '\r\n')
-
           echo "--- canary: rc=${CANARY_RC}, uname -m='${CANARY_ARCH}' ---"
           sed -n '1,40p' "${CANARY_LOG}" || true
-
           if [ "${CANARY_RC}" -eq 0 ] && [ "${CANARY_ARCH}" = "aarch64" ]; then
             echo "QEMU_ARM64=1" >> "${GITHUB_ENV}"
             echo "::notice title=arm64 模拟可用::canary 通过（guest=aarch64），已置 QEMU_ARM64=1"
@@ -1350,293 +808,152 @@ jobs:
             echo "::notice title=arm64 模拟不可用::canary 未通过（rc=${CANARY_RC}，uname -m='${CANARY_ARCH}'），已置 QEMU_ARM64=0"
             echo "::notice::下游 arm64 实跑验证会据此判定为「环境不支持」并阻断发布，不会伪装成产物缺陷。"
           fi
-
       # ---------------------------------------------------------------------
-
       # musl（Alpine）包补齐 GCC 运行库依赖
-
       #
-
       # 背景：ilspycmd 的 ELF 里有两条 NEEDED 依赖：
-
       #   NEEDED  libstdc++.so.6
-
       #   NEEDED  libgcc_s.so.1
-
       # self-contained 只打包 .NET 运行时，不含这两个 GCC 运行库。
-
       # 纯净 Alpine 默认也不带它们，于是用户解压后直接运行会报
-
       #   Error loading shared library libstdc++.so.6
-
       #
-
       # 实测结论（diag14/diag15，纯 Alpine 容器内验证）：
-
       #   P1 纯净 Alpine 直接运行                -> 失败
-
       #   P2 把库放进同目录，不设LD_LIBRARY_PATH -> 仍然失败
-
       #      （musl loader 只按 ld-musl-*.path + 默认目录搜索，
-
       #        不会搜索程序所在目录）
-
       #   P3 同目录 + LD_LIBRARY_PATH            -> 成功
-
       #   W1 给所有依赖方注入 RPATH='$ORIGIN'     -> 成功，且用户
-
       #      解压后可直接 ./ilspycmd，无需任何环境变量
-
       #
-
       # 因此采用 RPATH 方案：把 libstdc++/libgcc_s 随包分发，
-
       # 并给主程序及所有依赖它们的 .so 注入 RPATH=$ORIGIN。
-
       #
-
       # 体积代价：libstdc++.so.6.0.34约 2.7MB + libgcc_s.so.1 约 170KB
-
       # 许可：GCC Runtime Library Exception（随 GCC 分发，允许再分发）
-
       # ---------------------------------------------------------------------
 
       - name: 随包分发 GCC 运行库（仅 musl）
 
         if: startsWith(matrix.rid, 'linux-musl-')
-
         run: |
-
           set -euo pipefail
-
           OUT_DIR="out/${RID}"
-
           # 从 Alpine 官方仓库取出库文件。
-
           # 注意：Alpine 基础镜像不含任何许可证文件（实测
-
           # /usr/share/licenses 不存在），因此许可证文本由下面的
-
           # heredoc 内嵌写入，不依赖镜像内路径。
-
           #
-
           # ---- 历史缺陷的根因修复 ----
-
           # --platform 必须按目标 RID 显式指定。对 linux-musl-x64 而言
-
           # runner 是 x86_64，不指定时 docker 按宿主架构取 x86_64 的包，
-
           # 装出的 .so 与 musl-x64 产物架构不符。
-
           #
-
           # 【历史缺陷（已修复，保留记录）】此前取库的 docker run 没有
-
           # --platform，apk 在 x86_64 上执行，拿到的是 **x86_64** 的 .so，
-
           # 却被原样 cp 进 linux-musl-arm64 产物目录，于是
-
           # 目标机（麒麟 arm64）加载时报
-
           #   Error relocating ...: unsupported relocation type 1 / 6
-
           # 因为 x86-64 的 R_X86_64_64(1) / R_X86_64_GLOB_DAT(6) 在
-
           # aarch64 下是未定义的重定位编号（aarch64 从 257 起编）。
-
           # 现由「按 RID 显式 --platform」+「readelf 架构断言」双重保证。
-
           #
-
           # linux-musl-arm64 现已改在**原生 aarch64 runner** 上构建，即便
-
           # 漏写 --platform 也不会再取到错架构的包；但显式声明仍然是必要的
-
           # ——它是「目标架构」的唯一书面来源，也让 GCC-RUNTIME-LIBRARIES.txt
-
           # 里的 Fetched-from 记录保持诚实。
-
           #
-
           # 这里刻意**不用** apk --arch / --repository 交叉取包，理由：
-
           #   * --repository 必须硬编码 alpine 的具体版本号（v3.x），
-
           #     而本步骤用的是浮动标签 alpine:3。两者一旦漂移，就引入
-
           #     "镜像版本"与"仓库版本"不一致的新故障面。现在由 apk 在
-
           #     真正的 aarch64 用户态里自行解析依赖，版本一致性由
-
           #     alpine:3 这个标签天然保证。
-
           #   * apk 安装时会执行包内的 install/trigger 脚本，
-
           #     在 x86_64 上执行 aarch64 包的脚本并不总是安全。
-
           #   * 直接从 dl-cdn 下载 apk 再解包，则要先知道精确包版本，
-
           #     需要额外解析 APKINDEX，是三者里最脆的一种。
-
           # 因此采用 docker run --platform：linux-musl-x64 在 x86_64 runner 上
-
           # 取宿主架构的包（amd64，与目标一致）；linux-musl-arm64 则直接
-
           # 在原生 aarch64 宿主上取 aarch64 的包。
-
           #
-
           # RID -> 容器平台。注意 musl RID 到平台的映射不止一种：
-
           #   linux-musl-x64     -> linux/amd64
-
           #   linux-musl-arm64   -> linux/arm64
-
           # （linux-x64 / linux-arm64 是 glibc，不走本步骤）
-
           # 未知 RID 直接失败，绝不静默回退到宿主架构——
-
           # 静默回退正是本次事故的直接成因。
-
           case "$RID" in
-
             linux-musl-x64)
-
               ALPINE_PLATFORM="linux/amd64"
-
               ;;
-
             linux-musl-arm64)
-
               ALPINE_PLATFORM="linux/arm64"
-
               ;;
-
             *)
-
               echo "::error::未识别的 musl RID: $RID，无法确定 Alpine 容器平台"
-
               exit 1
-
               ;;
-
           esac
-
           echo "目标 RID=${RID} -> Alpine 容器平台=${ALPINE_PLATFORM}"
-
           echo "宿主架构=$(uname -m)（仅日志对照；取库一律以 ALPINE_PLATFORM 为准）"
-
           # -e 把 ALPINE_PLATFORM 传进容器：下面 sh -c 的脚本是单引号包住的，
-
           # 宿主机不会展开 ${ALPINE_PLATFORM}，必须让容器内的 sh 展开。
-
           docker run --rm --platform "${ALPINE_PLATFORM}" \
             -e "ALPINE_PLATFORM=${ALPINE_PLATFORM}" \
             -v "$PWD/${OUT_DIR}:/app" alpine:3 /bin/sh -c '
-
             set -e
-
             apk add --no-cache libstdc++ libgcc >/dev/null
-
-            # 真实文件 + SONAME 软链，缺一不可
-
             cp -L /usr/lib/libstdc++.so.6 /app/libstdc++.so.6
-
             cp -L /usr/lib/libgcc_s.so.1  /app/libgcc_s.so.1
-
             # 记录版本 + **架构**，便于排查与许可追溯。
-
             # 这一行曾经直接暴露了缺陷：发布出去的包里它写的是 x86_64。
-
             apk list -I libstdc++ libgcc > /app/GCC-RUNTIME-LIBRARIES.txt
-
             # 再把取包环境本身的架构写进清单，作为"取包环境正确"的独立证据。
-
             # 下面的 $(uname -m) 由容器内 sh 执行，记录的是容器而非宿主。
-
             # 分段标记让宿主可以无歧义地只解析 apk 那一段。
-
             {
-
               echo "Container environment (do not parse as package arch)"
-
               echo "Fetched-from: alpine:3 --platform ${ALPINE_PLATFORM}"
-
               echo "Container uname -m      : $(uname -m)"
-
               echo "Container /etc/apk/arch : $(cat /etc/apk/arch 2>/dev/null || echo unknown)"
-
             } >> /app/GCC-RUNTIME-LIBRARIES.txt
-
           '
-
           # 许可证必须与二进制一起分发。GPL 要求随分发附带许可*全文*，
-
           # 仅给 URL 链接不满足该要求。Alpine 镜像里也没有许可证文件，
-
           # 因此正文来自本仓库 licenses/ 目录（稀疏检出已带入），
-
           # 在这里拼接成一份随包文档。
-
           #
-
           # 依据（已核实，勿凭直觉改写）：
-
           #   - 上游 GCC 官方文档明确 libstdc++ 的许可为
-
           #     GPL-3.0-or-later WITH GCC-exception-3.1
-
           #     （gcc.gnu.org/onlinedocs/libstdc++/manual/license.html）
-
           #   - GCC Runtime Library Exception 不是独立许可证，而是叠加在
-
           #     GPL 之上的附加许可；真正授权再分发的是其第 1 节。
-
           #     写成"按 GCC Runtime Library Exception 授权"是不准确的。
-
           #   - Alpine 的包元数据把 gcc 源包整体标为
-
           #     GPL-2.0-or-later AND LGPL-2.1-or-later，那是整包标签，
-
           #     不是这两个文件的准确许可。
-
           #   - libstdc++ 是 GPLv3+exception3.1，libgcc_s 亦然；
-
           #     LGPL-2.1 在此不适用于这两个 .so，勿照抄 Alpine 标签。
-
           # -------------------------------------------------------------------
-
           GPL_TXT="repo-docs/licenses/GPL-3.0.txt"
-
           EXC_TXT="repo-docs/licenses/GCC-Runtime-Library-Exception-3.1.txt"
-
           # 许可证正文是本仓库的合规底线，缺失必须硬失败（此前踩过：
-
           # cp 失败被 || true 吞掉，产物无许可证但 CI 全绿）
-
           test -s "$GPL_TXT" || { echo "::error::缺少 GPLv3 正文: $GPL_TXT"; exit 1; }
-
           test -s "$EXC_TXT" || { echo "::error::缺少 GCC 例外正文: $EXC_TXT"; exit 1; }
-
           {
-
             cat <<'HEADER'
-
           libstdc++ (libstdc++.so.6) and libgcc_s (libgcc_s.so.1)
-
           ========================================================
-
           These runtime libraries are redistributed with ilspycmd so that the
-
           linux-musl-* archives run immediately after extraction, without
-
           requiring `apk add libstdc++ libgcc` on the target machine.
-
           Source packages (Alpine Linux):
             libstdc++-<version> <arch> {gcc}
             libgcc-<version>   <arch> {gcc}
-
           The files are taken UNMODIFIED from the official Alpine Linux
           repositories (the libstdc++ and libgcc packages of the gcc source
           package), fetched from a container matching the target RID so the
@@ -1644,607 +961,316 @@ jobs:
           above are replaced with the actual architecture during packaging.
           The exact versions shipped in this archive are listed in
           GCC-RUNTIME-LIBRARIES.txt next to this file.
-
           ------------------------------------------------------------------------
-
           License
-
           ------------------------------------------------------------------------
-
           Upstream GCC distributes these runtime libraries under:
-
               GPL-3.0-or-later WITH GCC-exception-3.1
-
           That is, the GNU General Public License version 3 (or, at your
-
           option, any later version) together with the GCC Runtime Library
-
           Exception 3.1.
-
           Note that the GCC Runtime Library Exception is NOT a standalone
-
           license. It is an additional permission layered on top of the GPL.
-
           The clause that actually authorizes redistribution is Section 1 of
-
           the Exception, reproduced in full below.
-
           Alpine Linux's own package metadata tags the gcc source package as
-
           "GPL-2.0-or-later AND LGPL-2.1-or-later". That is Alpine's packaging
-
           label for the package as a whole, not the precise license of these
-
           two shared objects. The authoritative statement is the upstream GCC
-
           one given above.
-
           The full text of the GNU General Public License version 3 and of the
-
           GCC Runtime Library Exception 3.1 follows. The GPL requires that the
-
           license text accompany the redistributed binaries, so the complete
-
           texts are reproduced here rather than merely linked.
-
           ------------------------------------------------------------------------
-
           GNU GENERAL PUBLIC LICENSE, Version 3
-
           ------------------------------------------------------------------------
-
           HEADER
-
             cat "$GPL_TXT"
-
             cat <<'MID'
-
           ------------------------------------------------------------------------
-
           GCC RUNTIME LIBRARY EXCEPTION, Version 3.1
-
           ------------------------------------------------------------------------
-
           MID
-
             cat "$EXC_TXT"
-
             cat <<'FOOTER'
-
           ------------------------------------------------------------------------
-
           If your system already provides libstdc++.so.6 and libgcc_s.so.1, the
-
           copies shipped in this archive are not used and may be safely deleted.
-
           FOOTER
-
           } > "${OUT_DIR}/LICENSE-GCC-RUNTIME-LIBRARY.txt"
-
           # 体积自检：两份正文合计约 38KB，若明显偏小说明正文被截断
-
           LICENSE_BYTES=$(wc -c < "${OUT_DIR}/LICENSE-GCC-RUNTIME-LIBRARY.txt")
-
           echo "LICENSE-GCC-RUNTIME-LIBRARY.txt: ${LICENSE_BYTES} 字节"
-
           if [ "$LICENSE_BYTES" -lt 30000 ]; then
-
             echo "::error::许可证文件偏小（${LICENSE_BYTES} 字节），正文可能被截断"
-
             exit 1
-
           fi
-
           # 从 apk 清单里读出**真实架构**，用于替换许可证里的 <arch> 占位符，
-
           # 并顺带校验 libstdc++ 与 libgcc 架构一致。
-
           # 只解析分段标记之前的 apk 输出，避免把下面的容器环境信息
-
           # （Fetched-from: / Container uname -m: ...）误当成包架构。
-
           MANIFEST="${OUT_DIR}/GCC-RUNTIME-LIBRARIES.txt"
-
           MARKER='Container environment (do not parse as package arch)'
-
           if [ ! -s "${MANIFEST}" ]; then
-
             echo "::error::GCC-RUNTIME-LIBRARIES.txt 缺失或为空，无法确认库架构"
-
             exit 1
-
           fi
-
           if ! grep -qxF -- "${MARKER}" "${MANIFEST}"; then
-
             echo "::error::GCC-RUNTIME-LIBRARIES.txt 缺少分段标记 ${MARKER}"
-
             cat "${MANIFEST}"
-
             exit 1
-
           fi
-
           # awk 在标记行处**直接 exit**，因此标记行本身（以及它后面的容器
-
           # 环境信息）都不会被解析成包架构。
-
           # 这里不能用 sed -n "1,/marker/p"：那个范围的右端是**闭区间**，
-
           # 会把标记行本身也交给 awk，而标记行的第 2 个字段是
-
           # "Container"/"(do" 之类的字面量，会污染架构集合。
-
           PKG_ARCHES=$(awk -v m="${MARKER}" 'index($0, m) == 1 { exit } NF { print $2 }' \
             "${MANIFEST}" | sort -u)
-
           if [ -z "${PKG_ARCHES}" ]; then
-
             echo "::error::无法从 apk 清单解析出包架构"
-
             cat "${MANIFEST}"
-
             exit 1
-
           fi
-
           if [ "$(printf '%s\n' "${PKG_ARCHES}" | wc -l)" -ne 1 ]; then
-
             echo "::error::libstdc++ 与 libgcc 架构不一致，拒绝打包："
-
             printf '%s\n' "${PKG_ARCHES}"
-
             cat "${MANIFEST}"
-
             exit 1
-
           fi
-
           GCC_ARCH=$(printf '%s\n' "${PKG_ARCHES}" | head -n 1)
-
           echo "apk 清单声明的库架构: ${GCC_ARCH}"
-
           # 把许可证文本里的 <arch> 占位符换成真实架构。
-
           # 此前这里是硬编码 x86_64 ——缺陷自证。
-
           sed -i "s/<arch>/${GCC_ARCH}/g" "${OUT_DIR}/LICENSE-GCC-RUNTIME-LIBRARY.txt"
-
           if grep -qF '<arch>' "${OUT_DIR}/LICENSE-GCC-RUNTIME-LIBRARY.txt"; then
-
             echo "::error::许可证中的 <arch> 占位符未被替换，拒绝打包"
-
             exit 1
-
           fi
-
           grep -n '{gcc}' "${OUT_DIR}/LICENSE-GCC-RUNTIME-LIBRARY.txt"
-
           # 注入 RPATH，让 loader 能找到同目录的库。
-
           # 必须对所有依赖方都注入：实测 libcoreclr.so、libhostfxr.so、
-
           # libhostpolicy.so、libclrgc.so、libclrjit.so 等 9 个 .so
-
           # 都有 NEEDED libstdc++/libgcc_s。
-
           sudo apt-get update -qq && sudo apt-get install -y -qq patchelf >/dev/null
-
           RPATH_PATCHED=0
-
           for f in "${OUT_DIR}/ilspycmd" "${OUT_DIR}"/*.so; do
-
             [ -f "$f" ] || continue
-
             if readelf -d "$f" 2>/dev/null | grep -qE "NEEDED.*(libstdc\+\+|libgcc_s)"; then
-
               patchelf --set-rpath '$ORIGIN' "$f"
-
               RPATH_PATCHED=$((RPATH_PATCHED + 1))
-
             fi
-
           done
-
           echo "已为 $RPATH_PATCHED 个文件注入 RPATH=\$ORIGIN"
-
-          # 校验：确认库和 RPATH 都在，且清单已生成
-
           test -f "${OUT_DIR}/libstdc++.so.6" || { echo "::error::libstdc++.so.6 缺失"; exit 1; }
-
           test -f "${OUT_DIR}/libgcc_s.so.1"  || { echo "::error::libgcc_s.so.1 缺失"; exit 1; }
-
           # 许可证必须一起打包：Alpine 镜像里没有许可证文件，
-
           # 若这里不校验，将来一旦 heredoc 写失败就会静默产出无许可证的包。
-
           test -s "${OUT_DIR}/LICENSE-GCC-RUNTIME-LIBRARY.txt" \
             || { echo "::error::GCC 运行库许可证文件缺失或为空"; exit 1; }
-
           cat "${OUT_DIR}/GCC-RUNTIME-LIBRARIES.txt"
-
           ls -lh "${OUT_DIR}"/libstdc++.so.6 "${OUT_DIR}"/libgcc_s.so.1 \
                   "${OUT_DIR}"/LICENSE-GCC-RUNTIME-LIBRARY.txt
-
       # ---------------------------------------------------------------------
-
       # 架构断言：包内每一个 ELF 都必须与目标 RID 同架构
-
       #
-
       # 这是一道"防复发"闸门。历史缺陷正是 x86_64 的 libstdc++/libgcc_s
-
       # 被原样打进 linux-musl-arm64 产物，而冒烟测试只覆盖 x64，
-
       # 于是一路发布出去，直到目标机（麒麟 arm64）才发现跑不起来。
-
       #
-
       # readelf -h 读的是目标文件头里的 e_machine 字段，与运行它的宿主
-
       # 无关，所以在 x86_64 runner 上校验 arm64 产物完全可靠，不需要 qemu。
-
       # 这也是为什么本步骤对所有 linux-* RID 生效，而不只是 musl。
-
       #
-
       # win-x64 是 PE 格式，readelf 读不了，不在本步骤范围内。
-
       # ---------------------------------------------------------------------
 
       - name: 架构断言（包内所有 ELF 必须匹配目标 RID）
 
         if: startsWith(matrix.rid, 'linux-')
-
         run: |
-
           set -euo pipefail
-
           OUT_DIR="out/${RID}"
-
           if ! command -v readelf > /dev/null 2>&1; then
-
             echo "::error::runner 上没有 readelf（binutils），无法做架构断言"
-
             exit 1
-
           fi
-
-          # RID -> readelf -h 输出的 Machine 字符串
-
           case "$RID" in
-
             linux-x64|linux-musl-x64)
-
               EXPECTED_MACHINE="Advanced Micro Devices X86-64"
-
               ;;
-
             linux-arm64|linux-musl-arm64)
-
               EXPECTED_MACHINE="AArch64"
-
               ;;
-
             *)
-
               echo "::error::未识别的 linux RID: $RID，无法确定期望架构"
-
               exit 1
-
               ;;
-
           esac
-
           echo "目标 RID=${RID}，期望 ELF Machine='${EXPECTED_MACHINE}'"
-
           ELF_COUNT=0
-
           BAD_COUNT=0
-
           # 主程序 + 全部共享库（含随包分发的 libstdc++/libgcc_s）。
-
           # 用 *.so* 而不是 *.so，才能覆盖 libstdc++.so.6 / libgcc_s.so.1
-
           # 这类带版本后缀的文件——它们正是当初被塞错架构的两个。
-
           for f in "${OUT_DIR}/ilspycmd" "${OUT_DIR}"/*.so*; do
-
             [ -f "$f" ] || continue
-
             BASE=$(basename "$f")
-
             MACHINE=$(readelf -h "$f" 2>/dev/null \
               | sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p') || MACHINE=""
-
             if [ -z "${MACHINE}" ]; then
-
               echo "::error::${BASE}：readelf 无法解析其 ELF 头，文件可能损坏或并非 ELF"
-
               BAD_COUNT=$((BAD_COUNT + 1))
-
               continue
-
             fi
-
             if [ "${MACHINE}" != "${EXPECTED_MACHINE}" ]; then
-
               echo "::error::${BASE}：ELF 架构错配！Machine='${MACHINE}'，期望 '${EXPECTED_MACHINE}'"
-
               BAD_COUNT=$((BAD_COUNT + 1))
-
               continue
-
             fi
-
             echo "  OK  ${BASE}  (${MACHINE})"
-
             ELF_COUNT=$((ELF_COUNT + 1))
-
           done
-
           echo "共校验 ${ELF_COUNT} 个 ELF 文件，架构错配 ${BAD_COUNT} 个"
-
           if [ "${BAD_COUNT}" -ne 0 ]; then
-
             echo "::error::包内存在与目标 RID 不匹配的 ELF，拒绝打包发布"
-
             exit 1
-
           fi
-
           # 防止上面的循环因 glob 没匹配而"空转通过"。
-
           # musl 包至少要有 ilspycmd + libstdc++.so.6 + libgcc_s.so.1。
-
           MIN_ELF=2
-
           case "$RID" in
-
             linux-musl-x64|linux-musl-arm64)
-
               MIN_ELF=3
-
               ;;
-
           esac
-
           if [ "${ELF_COUNT}" -lt "${MIN_ELF}" ]; then
-
             echo "::error::只校验到 ${ELF_COUNT} 个 ELF（期望至少 ${MIN_ELF} 个），架构断言未真正生效"
-
             exit 1
-
           fi
-
       # ---------------------------------------------------------------------
-
       # 冒烟测试：构建成功 != 能运行。
-
       #
-
       # 历史缺口：这里原本只验证 linux-x64（runner 原生）与
-
       # linux-musl-x64（Alpine 容器），arm64 是交叉编译产物、从未真正执行过。
-
       # 这正是 x86_64 的 .so 被打进 linux-musl-arm64 并发布出去、
-
       # 整整一个版本都没被发现的根本原因。
-
       #
-
       # 【现状】
-
       #   linux-musl-arm64  已在**原生 aarch64 runner** 的纯净 Alpine 容器中真正执行。
-
       #   linux-arm64（glibc）仍靠 qemu-user 模拟 + Debian arm64 镜像，属已知缺口。
-
       #   win-x64 已在原生 Windows runner 上实跑（见下），不再是缺口。
-
       #
-
       # 关键：这里刻意用「纯净 alpine」且不设任何 LD_LIBRARY_PATH，
-
       # 因为发行包必须做到解压即用。若这里 apk add 了 libstdc++，
-
       # 就等于掩盖了 RPATH 没生效的问题。
-
       # ---------------------------------------------------------------------
 
       - name: 冒烟测试（linux-x64，原生运行）
 
         if: matrix.rid == 'linux-x64'
-
         run: |
-
           set -euo pipefail
-
           chmod +x "out/${RID}/ilspycmd"
-
           "out/${RID}/ilspycmd" --version
 
       - name: 冒烟测试（linux-musl-x64，纯净 Alpine 解压即用验证）
 
         if: matrix.rid == 'linux-musl-x64'
-
         run: |
-
           set -euo pipefail
-
           chmod +x "out/${RID}/ilspycmd"
-
           docker run --rm -v "$PWD/out/${RID}:/app:ro" \
             alpine:3 /bin/sh -c 'cd /app && ./ilspycmd --version'
-
       # arm64 冒烟测试（linux-musl-arm64，原生 aarch64）：把「产物缺陷」与「环境不支持」彻底分开。
-
       #
-
       # 做法是两段式：
-
       #   第 1 段 环境自检（canary）：执行一个已知一定正常的 aarch64 命令
-
       #           （容器内 uname -m），并断言输出必须是 aarch64。
-
       #           这一段失败 => 是**运行环境**问题，与产物无关
-
       #           （产物还没被执行过）。
-
       #   第 2 段 产物验证：canary 通过后才执行 ilspycmd。此时若失败，
-
       #           只可能来自产物本身（架构错配 / 缺库 / RPATH 没生效）。
-
       #
-
       # 为什么必须先过 canary：若 matrix.include 里的 runner 标签被误改成
-
       # x86_64，`docker run --platform linux/arm64` 会报 "no matching manifest"
-
       # 或 "exec format error"，而产物里的 .so 架构不对时报的是
-
       # "unsupported relocation type"——前两者都是**环境**问题。
-
       # 不加 canary 就无法把这两类失败区分开，排查成本极高。
-
       #
-
       # 【与切到原生 arm 之前的差别】
-
       # 这一段过去证明的是「qemu 可用」；现在宿主本身就是 aarch64，它证明的是
-
       #   (a) 宿主与容器确实是 aarch64（不是被退回模拟），
-
       #   (b) --platform 声明与实际一致——而 (b) 正是上面取库步骤正确性的前提。
-
       # 价值没有消失，只是从「模拟可用性」变成了「架构一致性」。
 
       - name: 冒烟测试（linux-musl-arm64，原生 aarch64 解压即用验证）
 
         if: matrix.rid == 'linux-musl-arm64'
-
         run: |
-
           set -euo pipefail
-
           OUT_DIR="out/${RID}"
-
           chmod +x "${OUT_DIR}/ilspycmd"
-
-          # ---- 第 1 段：环境自检（canary）----
-
           echo "::group::环境自检：确认宿主与容器确实是 aarch64（未退回模拟）"
-
           CANARY_OUT=/tmp/arm64-canary.out
-
           CANARY_ERR=/tmp/arm64-canary.err
-
           RC=0
-
           docker run --rm --platform linux/arm64 alpine:3 \
             /bin/sh -c 'uname -m' > "${CANARY_OUT}" 2> "${CANARY_ERR}" || RC=$?
-
           if [ "${RC}" -ne 0 ]; then
-
             echo "--- canary stderr ---"
-
             tail -n 50 "${CANARY_ERR}" || true
-
             echo "::endgroup::"
-
             echo "::error title=环境不支持 / 第 1 段环境自检失败::无法执行 aarch64 容器。这**不是产物缺陷**——产物尚未被执行过。本步骤要求在**原生 aarch64 runner** 上构建 linux-musl-arm64（matrix.include 里应为 ubuntu-24.04-arm），且容器可正常启动。"
-
             exit 1
-
           fi
-
           CANARY_ARCH=$(tr -d '\r\n' < "${CANARY_OUT}")
-
           echo "guest uname -m = '${CANARY_ARCH}'"
-
           if [ "${CANARY_ARCH}" != "aarch64" ]; then
-
             echo "::endgroup::"
-
             echo "::error title=环境不支持 / 第 1 段环境自检失败::容器返回架构 '${CANARY_ARCH}' 而不是 aarch64，说明宿主不是原生 aarch64（matrix.include 的 runner 标签可能被改错），或 --platform linux/arm64 没有真正生效。这**不是产物缺陷**。"
-
             exit 1
-
           fi
-
           echo "宿主与容器架构均确认为 aarch64（原生执行，无模拟）"
-
           echo "::endgroup::"
-
-          # ---- 第 2 段：产物验证 ----
-
           echo "::group::产物验证：纯净 Alpine 中解压即用执行 ilspycmd --version"
-
           SMOKE_OUT=/tmp/arm64-smoke.out
-
           SMOKE_ERR=/tmp/arm64-smoke.err
-
           RC=0
 
           # timeout 600：原生 aarch64 上实测三级验证仅耗 2s，600s 是极宽松上限；
           # 保留超时是为了防止 .NET 运行时异常时挂死整个 job。
           # busybox 自带 timeout，无需额外安装。
-
           # 产物目录只读挂载（:ro），确保测的是"解压即用"而非可写环境的假象。
-
           docker run --rm --platform linux/arm64 -v "$PWD/${OUT_DIR}:/app:ro" \
             alpine:3 /bin/sh -c 'cd /app && timeout 600 ./ilspycmd --version' \
             > "${SMOKE_OUT}" 2> "${SMOKE_ERR}" || RC=$?
-
           echo "--- stdout ---"
-
           tail -n 200 "${SMOKE_OUT}" || true
-
           echo "--- stderr（最多 200 行）---"
-
           tail -n 200 "${SMOKE_ERR}" || true
-
           echo "::endgroup::"
-
           if [ "${RC}" -eq 0 ]; then
-
             if [ ! -s "${SMOKE_OUT}" ]; then
-
               echo "::error title=产物缺陷::ilspycmd --version 退出码为 0 却没有任何输出，产物不可信"
-
               exit 1
-
             fi
-
             echo "linux-musl-arm64 在原生 aarch64 的纯净 Alpine 中运行成功（无模拟）"
-
             exit 0
-
           fi
-
           # ---- 失败分类：区分「产物缺陷」与「环境限制」 ----
-
           # 判定依据（按特异性从高到低）：
-
           #   1) unsupported relocation type => 一定是架构错配。x86-64 的
-
           #      R_X86_64_64(1) / R_X86_64_GLOB_DAT(6) 在 aarch64 下是
-
           #      未定义编号（aarch64 从 257 起编），只有 x86_64 的 .so 才会
-
           #      触发。canary 已证明容器确实是 aarch64，故为产物缺陷。
-
           #   2) Error loading shared library => 缺库或 RPATH 未生效，产物缺陷。
-
           #   3) 镜像/容器层报错 => 环境不支持。
-
           #   4) 其它（含超时/崩溃）=> 证据不足，标注清楚后同样
-
           #      阻断发布，避免把不确定的东西当"已验证"放出去。
-
           # 无论哪一类都 exit 1：宁可 CI 失败也不发一个未经验证的包。
-
           # 区别在于标题与排查方向，让值班的人不用从 28 万行 stderr 里猜。
-
           if grep -qF 'unsupported relocation type' "${SMOKE_ERR}"; then
             echo "::error title=产物缺陷 / 架构错配::包内存在非 aarch64 的 .so，目标机加载时报 unsupported relocation type。参见本 job「架构断言」步骤的输出。"
             exit 1
@@ -2303,20 +1329,17 @@ jobs:
           # 只保留 nounset 与 pipefail，失败判定全部手工完成。
           set +e
           set -uo pipefail
-
           OUT_DIR="out/${RID}"
           FAILED=0
           note()    { echo "  [验证] $*"; }
           fail()    { echo "::error title=产物缺陷::$*"; FAILED=1; }
           envfail() { echo "::error title=环境不支持::$*"; FAILED=1; }
-
           if [ ! -d "${OUT_DIR}" ]; then
             echo "::error::产物目录不存在: ${OUT_DIR}"
             exit 1
           fi
           ABS_OUT="$(cd "${OUT_DIR}" && pwd)"
           SMOKE_DIR="$(pwd)/smoke"
-
           case "$RID" in
             win-x64) ABS_ILSPY="${ABS_OUT}/ilspycmd.exe" ;;
             *)       ABS_ILSPY="${ABS_OUT}/ilspycmd" ;;
@@ -2333,7 +1356,6 @@ jobs:
           # 特征串（class Greeter / Sum / enum Color）供 L3 产物断言使用。
           rm -rf smoke
           mkdir -p smoke
-
           cat > smoke/Smoke.csproj <<'CSPROJ'
           <Project Sdk="Microsoft.NET.Sdk">
             <PropertyGroup>
@@ -2345,11 +1367,9 @@ jobs:
             </PropertyGroup>
           </Project>
           CSPROJ
-
           cat > smoke/Class1.cs <<'CS'
           using System;
           using System.Collections.Generic;
-
           namespace SmokeTarget
           {
               public class Greeter
@@ -2363,15 +1383,12 @@ jobs:
                       return r;
                   }
               }
-
               public enum Color { Red, Green, Blue }
           }
           CS
-
           dotnet build smoke/Smoke.csproj -c Release -o smoke/out --nologo -v q \
             > smoke/build.log 2>&1 \
             || { echo "::error::无法构建冒烟测试程序集"; tail -40 smoke/build.log; exit 1; }
-
           TARGET_DLL="${SMOKE_DIR}/out/SmokeTarget.dll"
           if [ ! -f "${TARGET_DLL}" ]; then
             echo "::error::冒烟测试程序集未生成: ${TARGET_DLL}"
@@ -2389,13 +1406,11 @@ jobs:
             # 通过时打印 VERIFY_RESULT=PASS，失败时打印 VERIFY_RESULT=PRODUCT_DEFECT。
             set -u
             DIR="${1:-}"
-
             if [ -z "$DIR" ] || [ ! -d "$DIR" ]; then
               echo "VERIFY_RESULT=PRODUCT_DEFECT"
               echo "  反编译输出目录不存在: '${DIR}'"
               exit 1
             fi
-
             CS_FILES=$(find "$DIR" -type f -name '*.cs' 2>/dev/null)
             if [ -z "$CS_FILES" ]; then
               echo "VERIFY_RESULT=PRODUCT_DEFECT"
@@ -2405,7 +1420,6 @@ jobs:
               exit 1
             fi
             echo "  生成的 .cs 文件数: $(printf '%s\n' "$CS_FILES" | wc -l | tr -d ' ')"
-
             BODY=$(cat $CS_FILES 2>/dev/null)
             MISSING=""
             for MARKER in 'class Greeter' 'Sum' 'enum Color'; do
@@ -2415,7 +1429,6 @@ jobs:
                 MISSING="${MISSING} [${MARKER}]"
               fi
             done
-
             if [ -n "$MISSING" ]; then
               echo "VERIFY_RESULT=PRODUCT_DEFECT"
               echo "  产物缺失特征串:${MISSING}"
@@ -2423,7 +1436,6 @@ jobs:
               cat $CS_FILES 2>/dev/null | head -40
               exit 1
             fi
-
             echo "  产物内容断言全部通过（class Greeter / Sum / enum Color）"
             echo "VERIFY_RESULT=PASS"
             exit 0
@@ -2441,14 +1453,10 @@ jobs:
             REFDIR="${2:-}"
             TARGET="${3:-}"
             DECOMP="${4:-}"
-
             # 必须在任何 cd 之前把脚本自身目录解析成绝对路径：
             # 下面 L3 会 cd 进输出目录，届时相对路径已失效。
             SELF_DIR=$(cd "$(dirname "$0")" && pwd)
-
             echo "运行环境架构: $(uname -m)"
-
-            # ---- L1: -h ----
             echo "--- L1 -h ---"
             if "$ILSPY" -h > /tmp/l1.txt 2>&1; then
               L1_SIZE=$(wc -c < /tmp/l1.txt | tr -d ' ')
@@ -2465,8 +1473,6 @@ jobs:
               head -20 /tmp/l1.txt
               exit 1
             fi
-
-            # ---- L2: --version ----
             echo "--- L2 --version ---"
             if "$ILSPY" --version > /tmp/l2.txt 2>&1; then
               VERSION_LINE=$(head -1 /tmp/l2.txt)
@@ -2491,8 +1497,6 @@ jobs:
               head -20 /tmp/l2.txt
               exit 1
             fi
-
-            # ---- L3: 真实反编译 ----
             echo "--- L3 真实反编译 ---"
             rm -rf "$DECOMP"
             mkdir -p "$DECOMP"
@@ -2508,14 +1512,10 @@ jobs:
               head -30 /tmp/l3.txt
               exit 1
             fi
-
-            # ---- L3 产物内容断言 ----
             echo "--- L3 产物内容断言 ---"
             sh "${SELF_DIR}/verify_decomp.sh" "$DECOMP"
             exit $?
           RUNCHECKS
-
-          # ---- 按 RID 决定执行环境 ----
           RUNNER=""
           case "$RID" in
             linux-x64)        RUNNER="native" ;;
@@ -2529,7 +1529,6 @@ jobs:
               ;;
           esac
           note "执行方式: ${RUNNER}（RID=${RID}）"
-
           # 统一的日志回放 + 失败分类。
           # VERIFY_RESULT 由被调脚本给出；容器起不来时按 docker 的特征串归为环境问题。
           run_and_classify() {
@@ -2558,7 +1557,6 @@ jobs:
             fi
             return 1
           }
-
           case "$RUNNER" in
             native)
               DECOMP_NATIVE="${SMOKE_DIR}/decompiled-native"
@@ -2680,7 +1678,6 @@ jobs:
               fi
               ;;
           esac
-
           if [ "${FAILED}" -ne 0 ]; then
             echo "::error::RID=${RID} 真机验证未全部通过，拒绝打包与发布"
             exit 1
@@ -2690,11 +1687,8 @@ jobs:
 
         shell: bash
         run: |
-
           set -euo pipefail
-
           mkdir -p dist
-
           cd "out/${RID}"
 
           # Windows runner 上**没有 zip 命令**（PowerShell 也认不出它），
@@ -2703,7 +1697,6 @@ jobs:
           #   artifacts/ilspycmd-*-<rid>.zip
           # 核对对两个平台是同一套规则，不会误判「产物缺失」。
           ZIP_NAME="ilspycmd-${RELEASE_TAG}-${RID}.zip"
-
           if [ "${RUNNER_OS}" = "Windows" ]; then
             if ! command -v 7z >/dev/null 2>&1; then
               echo "::error::Windows runner 上找不到 7z，无法打包。windows-latest 镜像预装 7-Zip，若此处失败说明镜像被裁剪过。"
@@ -2726,60 +1719,37 @@ jobs:
             zip -r -9 -q "../../dist/${ZIP_NAME}" .
             echo "已用 zip 打包: ${ZIP_NAME}"
           fi
-
           cd ../..
-
           # 产物名必须与 publish 阶段的门禁约定严格一致，否则会被判成「产物缺失」。
           test -f "dist/${ZIP_NAME}" \
             || { echo "::error::压缩包未生成: dist/${ZIP_NAME}"; exit 1; }
-
           ls -lh dist
       - name: 上传构建产物
 
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-
         with:
-
           name: ilspycmd-${{ matrix.rid }}
-
           path: dist/*.zip
-
           retention-days: 14         # 保留久一点，方便发布失败后排查
-
           if-no-files-found: error
-
   # ---------------------------------------------------------------------
-
   # 第 3 步：汇总所有产物，生成 SHA256SUMS，发布/更新到本仓库 Release
-
   #   只有这个 job 拥有 contents: write，且不检出、不执行任何第三方源码。
-
   # ---------------------------------------------------------------------
-
   publish:
-
     needs: [check-version, build]
-
     if: needs.check-version.outputs.should_build == 'true'
-
     runs-on: ubuntu-24.04
-
     permissions:
-
       contents: write
-
     steps:
 
       - name: 下载所有构建产物
 
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-
         with:
-
           path: artifacts
-
           pattern: ilspycmd-*
-
           merge-multiple: true
 
       # ---------------------------------------------------------------------
@@ -2797,13 +1767,9 @@ jobs:
       - name: 发布门禁：核对 5 个 RID 的产物齐备
 
         run: |
-
           set -euo pipefail
-
           EXPECTED_RIDS="linux-x64 linux-arm64 linux-musl-x64 linux-musl-arm64 win-x64"
-
           MISSING=""
-
           for RID_NAME in ${EXPECTED_RIDS}; do
             MATCHED=$(ls -1 artifacts/ilspycmd-*-"${RID_NAME}".zip 2>/dev/null | head -1 || true)
             if [ -z "${MATCHED}" ]; then
@@ -2813,135 +1779,77 @@ jobs:
               echo "  [就绪] ${RID_NAME} -> $(basename "${MATCHED}")"
             fi
           done
-
           if [ -n "${MISSING}" ]; then
             echo "::error::以下 RID 的构建产物缺失，拒绝创建 Release:${MISSING}"
             echo "--- artifacts 目录实际内容 ---"
             ls -la artifacts || true
             exit 1
           fi
-
           echo "5 个 RID 的产物全部齐备，允许进入 Release 发布步骤"
 
       - name: 生成 SHA256SUMS
 
         working-directory: artifacts
-
         run: |
-
           set -euo pipefail
-
           sha256sum *.zip > SHA256SUMS
-
           cat SHA256SUMS
-
       # -------------------------------------------------------------------
-
       # 生成 latest.json 并回写到「全部」Release
-
       #
-
       # 【为什么不能只用 GitHub 的 releases/latest】
-
       # GitHub 的 latest 指向「发布时间最新」的非 draft、非 prerelease Release。
-
       # 上游完全可能先发 v11.0、之后补发 v10.0（回溯版本、重建、误操作等），
-
       # 此时 GitHub 的 latest 会指向 v10.0 —— 语义错误。
-
       # 因此这里必须自己枚举全部 Release，用 SemVer 数值比较取最大者。
-
       #
-
       # 【为什么回写到全部 Release 而不是仅当前这个】
-
       # 用户通常通过 releases/latest/download/latest.json 取清单，但该别名
-
       # 会随 GitHub 的 latest 漂移。为了让「任何一个 Release 里的latest.json」
-
       # 都给出同一个正确的最新版本，这里把同一份内容写到所有 Release。
-
       # -------------------------------------------------------------------
 
 
       - name: 发布 GitHub Release
 
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-
         with:
-
           tag_name: ${{ needs.check-version.outputs.version }}
-
           name: "ilspycmd ${{ needs.check-version.outputs.version }} (self-contained)"
-
           prerelease: ${{ needs.check-version.outputs.prerelease == 'true' }}
-
           body: |
-
             ## 简介 / Overview
-
             自动构建自 [icsharpcode/ILSpy@${{ needs.check-version.outputs.version }}](${{ needs.check-version.outputs.release_url }})（commit `${{ needs.check-version.outputs.commit }}`）的 `ilspycmd` self-contained 版本。压缩包内已包含对应平台的 .NET 运行时，解压即可直接运行，**目标机器无需安装 .NET SDK/Runtime**。已移除调试符号（`*.pdb` / `*.dbg`）、`createdump` 及 API 文档注释（`*.xml`）等对最终用户无用的文件，仅保留运行所需内容。
-
             Self-contained build of `ilspycmd`, automatically compiled from [icsharpcode/ILSpy@${{ needs.check-version.outputs.version }}](${{ needs.check-version.outputs.release_url }}) at commit `${{ needs.check-version.outputs.commit }}`. Each archive bundles its own .NET runtime — **no .NET SDK/Runtime installation is required** on the target machine. Debug symbols (`*.pdb` / `*.dbg`), the `createdump` crash-dump helper, and API doc-comment `*.xml` files have been stripped, leaving only what's needed to run.
-
             本 Release 由 GitHub Actions 定时自动生成，非 ILSpy 官方发布。
-
             This release is generated automatically on a schedule by GitHub Actions and is **not** an official ILSpy release.
-
             构建记录 / Build run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
             ## 下载 / Downloads
-
             | 平台 / Platform | 文件 / File |
-
             | --- | --- |
-
             | Linux x64 (glibc，如 Ubuntu/Debian/CentOS) | `ilspycmd-${{ needs.check-version.outputs.version }}-linux-x64.zip` |
-
             | Linux arm64 (glibc) | `ilspycmd-${{ needs.check-version.outputs.version }}-linux-arm64.zip` |
-
             | Linux x64 (musl，如 Alpine) | `ilspycmd-${{ needs.check-version.outputs.version }}-linux-musl-x64.zip` |
-
             | Linux arm64 (musl) | `ilspycmd-${{ needs.check-version.outputs.version }}-linux-musl-arm64.zip` |
-
             | Windows x64 | `ilspycmd-${{ needs.check-version.outputs.version }}-win-x64.zip` |
-
             下载后请用 `SHA256SUMS` 核对文件完整性。
-
             Please verify downloads against the checksums in `SHA256SUMS`.
-
             > 说明 / Note：**全部 5 个平台**（linux-x64、linux-arm64、linux-musl-x64、linux-musl-arm64、win-x64）在发布前都通过了三级验证：**L1** `-h`、**L2** `--version`、**L3** 对一个真实 demo 程序集的反编译，**且校验反编译产物内容**（必须生成 `.cs` 并包含预期类型/成员）。Linux 产物另做「解压即用」验证（纯净容器内不设 `LD_LIBRARY_PATH`）：`linux-musl-arm64` 在**原生 aarch64 runner** 上执行，`linux-arm64`（glibc）经 `qemu-user` 模拟 aarch64 执行，并对包内**每一个 ELF** 做架构断言（`readelf -h`）；Windows 产物在**原生 Windows runner** 上直接实跑。**任一环节失败即中止，不产出 Release。**
-
             > **All five platforms** (linux-x64, linux-arm64, linux-musl-x64, linux-musl-arm64, win-x64) pass a three-stage verification before release: **L1** `-h`, **L2** `--version`, and **L3** an actual decompilation of a real demo assembly whose **output content is asserted** (a `.cs` file must be produced and contain the expected types/members). Linux artifacts additionally verify "runs straight after extraction" inside a clean container (no `LD_LIBRARY_PATH`): `linux-musl-arm64` is executed on a **native aarch64 runner**, while `linux-arm64` (glibc) is executed under `qemu-user` aarch64 emulation; an architecture assertion (`readelf -h`) over **every** ELF in the archive applies to all of them; the Windows artifact is executed on a **native Windows runner**. **Any failing stage aborts the workflow — no Release is produced.**
-
             > ### 自动更新：`latest.json`
-
             > 本 Release 包含 `latest.json`，内含各平台资产的绝对地址与 SHA-256。其中的 `latest_version` 由**全部 Release tag 的 SemVer 数值比较**得出，**不使用发布时间**——因为 GitHub 内置的 `releases/latest` 按发布时间选取，在「先发 v11.0、后发 v10.0」时会错误地指向 v10.0。请一律以 `latest.json` 为准：
-
             > ```
-
             > https://github.com/taozhiyu/ILSpy-Binaries/releases/latest/download/latest.json
-
             > ```
-
             > 该地址与版本无关，长期有效。以 `_` 开头的键为注释项，客户端可安全忽略。
-
             > This release ships `latest.json`, which lists the absolute URL and SHA-256 of every asset. `latest_version` is resolved by **SemVer comparison across all release tags**, deliberately NOT by publication time: GitHub's own `releases/latest` ranks by publication time and would wrongly point at `v10.0` if `v11.0` were published first. Always trust `latest.json`. Keys prefixed with `_` are comments and may be ignored.
-
             > **格式变更（破坏性）/ Breaking format change**：`latest.json` 已精简为 `schema_version` / `repository` / `latest_version` / `generated_at` / `assets[]` / `license` / `_comment`。移除了 `upstream_version`、`upstream_repository`、`upstream_release_url`、`version_resolution`、`checksum_source`、`checksums`，以及 `assets[].file`（文件名可由 `url` 直接取）。`latest_version`、`assets[].rid/url/sha256` 的语义与位置**未变**。若你的客户端读取过上述被移除的字段，请改用 `url` 与 `assets[].sha256`。
-
             > **Breaking format change**: `latest.json` has been slimmed down to `schema_version` / `repository` / `latest_version` / `generated_at` / `assets[]` / `license` / `_comment`. The fields `upstream_version`, `upstream_repository`, `upstream_release_url`, `version_resolution`, `checksum_source`, `checksums` and `assets[].file` have been **removed** (the file name is directly derivable from `url`). The meaning and location of `latest_version` and `assets[].rid/url/sha256` are **unchanged**. If your client read any of the removed fields, use `url` and `assets[].sha256` instead.
-
             > musl 包说明 / musl packages：`ilspycmd` 的 ELF 依赖 `libstdc++.so.6` 与 `libgcc_s.so.1`（self-contained 只打包 .NET 运行时，不含GCC 运行库）。为实现解压即用，`linux-musl-*` 包内已随附这两个库，并为所有相关二进制注入了 `RPATH=$ORIGIN`。它们来自 Alpine 官方仓库的 `libstdc++` / `libgcc` 包，按 **`GPL-3.0-or-later WITH GCC-exception-3.1`** 许可分发（注意：GCC Runtime Library Exception 是叠加在 GPL 之上的附加许可，并非独立许可证）；包内 `LICENSE-GCC-RUNTIME-LIBRARY.txt` 内嵌了 GPLv3 与该例外的**完整正文**。版本清单见 `GCC-RUNTIME-LIBRARIES.txt`。若你的系统已提供这两个库，可安全删除包内副本。
-
             > The `linux-musl-*` archives ship `libstdc++.so.6` and `libgcc_s.so.1` with `RPATH=$ORIGIN` baked in, so they run immediately after extraction with no extra packages. They come from Alpine's `libstdc++` / `libgcc` packages under **`GPL-3.0-or-later WITH GCC-exception-3.1`** (the GCC Runtime Library Exception is an additional permission layered on top of the GPL, not a standalone license). `LICENSE-GCC-RUNTIME-LIBRARY.txt` embeds the **complete texts** of the GPLv3 and of that exception; see `GCC-RUNTIME-LIBRARIES.txt` for the exact versions. If your system already provides them, deleting the bundled copies is safe.
-
           files: |
-
             artifacts/*.zip
-
             artifacts/SHA256SUMS
-
       # 把 latest.json 回写到每一个正式版 Release。
 
       # 这样无论用户从哪个 Release 进入，看到的都是同一份正确清单。
@@ -2965,29 +1873,17 @@ jobs:
       # 所以顺序必须是：建 Release -> 生成 latest.json -> 回写 latest.json。
       # 「回写」步骤会重新枚举全部 Release，因此新版本也在内，无需额外处理。
       # ---------------------------------------------------------------------
-
         id: latest
-
         env:
-
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
           GH_REPO: ${{ github.repository }}
-
           SERVER_URL: ${{ github.server_url }}
-
           UPSTREAM_URL: ${{ needs.check-version.outputs.release_url }}
-
           CURRENT_TAG: ${{ needs.check-version.outputs.version }}
-
         run: |
-
           set -euo pipefail
-
           echo "::group::枚举全部 Release 并按 SemVer 排序"
-
           # 只保留正式版（排除 draft 与 prerelease），与 latest.json 的语义一致
-
           ALL_JSON=$(curl -fsS --retry 3 --retry-all-errors \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
@@ -3030,146 +1926,79 @@ jobs:
           if [ "$WAITED" -gt 0 ]; then
             echo "已在第 ${WAITED} 次重试后查到 ${CURRENT_TAG}"
           fi
-
           # 提取 tag：排除 draft 与 prerelease
-
           #
-
           # grep 用严格格式：可选 v 前缀 + 至少两段纯数字 + 可选第三段数字，
-
           # 且后面不能再跟任何字符。宽泛的 '^v?[0-9]+\.[0-9]+' 会放行
-
           #     注意：本仓库 tag 直接取自上游 icsharpcode/ILSpy 的 tag_name，
-
           #     上游目前是三段式（v9.1 / v11.0），故两段+可选第三段足够。
-
           #     若上游改用四段式（如 v11.0.1.2），此处会全滤掉导致 TAGS 为空
-
           #     而 exit 1。届时需放宽为 ^v?[0-9]+(\.[0-9]+)*$。
-
           # v11.x / v11.0-rc 之类脏值：它们的数值段会被兜底成 0，与合法
-
           # 版本算作同分，导致 latest.json 指向不确定（实测 v11.x 会胜出）。
-
           TAGS=$(printf '%s' "$ALL_JSON" \
             | jq -r '.[] | select(.draft==false and .prerelease==false) | .tag_name' \
             | grep -E '^v?[0-9]+\.[0-9]+(\.[0-9]+)?$' \
             | sort -u)
-
           if [ -z "$TAGS" ]; then
-
             echo "::error::没有任何可解析的正式版 Release tag"
-
             exit 1
-
           fi
-
           # ---- SemVer 数值比较 ----
-
           # 不能用 sort -V：它对 "v11.0" 与 "v11.0.1" 之类边界行为不够可控，
-
           # 这里显式拆成 major/minor/patch 三段做整数比较。
-
           # 缺省段补 0，因此 v11.0 与 v11.0.0 等价。
-
           #
-
           # 【已实测修复的两个坑，勿改回】
-
           #   1) 必须用严格大于（-gt），不能用 -ge/>=：v11.0 与 v11.0-rc.1 的
-
           #      major/minor/patch 完全相同，若同分也替换则先遇到的 rc 会胜出，
-
           #      latest.json 会错误地指向预发布版本。严格大于是让数值完全相同
-
           #      时保持先出现者胜出。
-
           #   2) 必须显式跳过含 - 或 + 的 tag：GitHub 的 .prerelease 标记未必
-
           #      覆盖所有情况（手动打的 rc tag 可能被标为正式版），而且 rc 与
-
           #      正式版数值全同，不跳过就会污染比较结果。
-
           BEST_TAG=""
-
           BEST_MAJOR=-1; BEST_MINOR=-1; BEST_PATCH=-1
-
           COMPARED=""
-
           while IFS= read -r t; do
-
             [ -n "$t" ] || continue
-
             # 含预发布/构建元数据的 tag 一律跳过：正式版优先
-
             case "$t" in *-*|*+*) echo "跳过非正式版 tag: $t"; continue ;; esac
-
             body="${t#v}"
-
             core="${body%%-*}"
-
             core="${core%%+*}"
-
             maj="${core%%.*}"; rest="${core#*.}"
-
             min="${rest%%.*}"; pat="${rest#*.}"
-
             case "$pat" in *.*) pat="${pat%%.*}" ;; esac
-
             # 非纯数字段一律当 0，防止排序错乱
-
             is_num() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
-
             is_num "$maj" || maj=0
-
             is_num "$min" || min=0
-
             is_num "$pat" || pat=0
-
             COMPARED="${COMPARED}${COMPARED:+,}${t}"
-
             if [ "$maj" -gt "$BEST_MAJOR" ] \
                || { [ "$maj" -eq "$BEST_MAJOR" ] && [ "$min" -gt "$BEST_MINOR" ]; } \
                || { [ "$maj" -eq "$BEST_MAJOR" ] && [ "$min" -eq "$BEST_MINOR" ] \
                     && [ "$pat" -gt "$BEST_PATCH" ]; }; then
-
               BEST_TAG="$t"; BEST_MAJOR="$maj"; BEST_MINOR="$min"; BEST_PATCH="$pat"
-
             fi
-
           done <<< "$TAGS"
-
           if [ -z "$BEST_TAG" ]; then
-
             echo "::error::SemVer 比较失败，未选出最新版本"
-
             exit 1
-
           fi
-
           echo "参与比较的 tag: ${COMPARED}"
-
           echo "SemVer 最大值: ${BEST_TAG} (${BEST_MAJOR}.${BEST_MINOR}.${BEST_PATCH})"
-
           echo "本次构建的 tag: ${CURRENT_TAG}"
-
           if [ "$BEST_TAG" != "$CURRENT_TAG" ]; then
-
             echo "::notice::最新版本(${BEST_TAG})与本次构建版本(${CURRENT_TAG})不同，"
-
             echo "::notice::latest.json 将指向 ${BEST_TAG}。"
-
             echo "::notice::这说明存在发布时间更晚但版本更低的 Release，"
-
             echo "::notice::latest.json 已按 SemVer 纠正为 ${BEST_TAG}。"
-
           fi
-
           # ---- 收集被选中版本的资产 ----
-
           TARGET_JSON=$(printf '%s' "$ALL_JSON" | jq -c --arg t "$BEST_TAG" \
             '.[] | select(.tag_name == $t)')
-
           TARGET_URL=$(printf '%s' "$TARGET_JSON" | jq -r '.html_url')
 
           # ---- 摘要来源：直接取该 Release 已有的 SHA256SUMS 资产 ----
@@ -3188,27 +2017,17 @@ jobs:
           # 那种情况显式标注 checksum_source 并回退到本地重算，
           # 而不是让整个 publish 静默失败。
           CACHE_DIR="$(pwd)/.latest-assets/${BEST_TAG}"
-
           mkdir -p "$CACHE_DIR"
-
           SUMS_FILE="$CACHE_DIR/SHA256SUMS"
-
           # 缺任一 RID 说明该版本资产不全，不能作为 latest（先查，最便宜）
           for rid in ${RID_LIST}; do
-
             name="ilspycmd-${BEST_TAG}-${rid}.zip"
-
             if ! printf '%s' "$TARGET_JSON" | jq -e --arg n "$name" \
                  '.assets[]? | select(.name == $n)' >/dev/null; then
-
               echo "::error::版本 ${BEST_TAG} 缺少资产 ${name}，无法生成 latest.json"
-
               exit 1
-
             fi
-
           done
-
           CHECKSUM_SOURCE="release-asset"
 
           # 优先走 SHA256SUMS 资产。
@@ -3241,63 +2060,38 @@ jobs:
           fi
           # 该 Release 若确实没有这个资产（早于该文件引入），上面的 if 不会进，
           # SUMS_RC 保持 1，直接走兜底——这不是延迟，是资产真的不存在。
-
           if [ "$SUMS_RC" -eq 0 ]; then
             echo "摘要来源: 该 Release 的 SHA256SUMS 资产（$(wc -c < "$SUMS_FILE" | tr -d ' ') 字节）"
           else
             # 会下载全量zip，故明确告警——这是可观测的降级，不是静默行为。
             CHECKSUM_SOURCE="recomputed-fallback-no-sums-asset"
-
             echo "::warning title=摘要来源降级::版本 ${BEST_TAG} 没有 SHA256SUMS 资产（早于该文件引入），回退为下载 zip 本地重算。"
-
             : > "$SUMS_FILE"
-
             for rid in ${RID_LIST}; do
-
               name="ilspycmd-${BEST_TAG}-${rid}.zip"
-
               echo "下载 ${name} 以重算摘要..."
-
               if ! curl -fsS --retry 3 --retry-all-errors -L \
                    -H "Authorization: Bearer ${GH_TOKEN}" \
                    -H "Accept: application/octet-stream" \
                    -o "${CACHE_DIR}/${name}" \
                    "${SERVER_URL}/${GH_REPO}/releases/download/${BEST_TAG}/${name}"; then
-
                 echo "::error::下载 ${name} 失败"
-
                 exit 1
-
               fi
-
               ( cd "$CACHE_DIR" && sha256sum "$name" >> "$SUMS_FILE" )
-
             done
-
           fi
-
           {
-
             echo "tag=$BEST_TAG"
-
             echo "url=$TARGET_URL"
-
             echo "compared=$COMPARED"
-
           } >> "$GITHUB_OUTPUT"
-
           echo "::endgroup::"
-
           # ---- 生成 JSON ----
-
           # 用 jq --arg 逐字段注入，避免任何手工转义带来的注入风险。
-
           # 注意：资产 URL 用构造方式而非读取 API 返回的 browser_download_url，
-
           # 因为后者指向 objects.githubusercontent.com 的重定向地址，
-
           # 不是稳定可用的公开地址。
-
           jq -n \
             --arg repo "$SERVER_URL/${GH_REPO}" \
             --arg latest_version "$BEST_TAG" \
@@ -3308,165 +2102,92 @@ jobs:
             --arg c_lic_en $'"repository" refers to the original files in this repository; "upstream" refers to the ILSpy binaries distributed with the packages. Only the linux-musl-* packages additionally bundle the GCC runtime libraries.' \
             --rawfile sums "$SUMS_FILE" \
             '
-
             # 从 SHA256SUMS 文本行解析成 {文件名: 摘要}
-
             # 【已实测修复的两个坑，勿改回】
-
             #  a) 必须用 --rawfile，不能用 --slurpfile。SHA256SUMS 是纯文本，
-
             #     不是合法 JSON；--slurpfile 会按 JSON 解析并直接失败
-
             #     (exit 3, Invalid JSON text)，latest.json 根本生成不出来。
-
             #     --rawfile 把整个文件读成单个字符串，所以用 $sums 而非 $sums[0]。
-
             #  b) 正则需要 2 个反斜杠（\\s / \\*）。转义链路是：
-
             #     YAML block scalar(原样) -> shell 单引号(原样) -> jq 程序文本，
-
             #     jq 再按 JSON 规则解码自己的字符串字面量。所以文件里写 2 个
-
             #     反斜杠，解码后正则引擎才收到 1 个，即空白类 \s 与字面星号 \*。
-
             #     写成 1 个：jq 直接 Invalid \escape 编译失败；
-
             #     写成 4 个：解码成 2 个，正则变成匹配「字面反斜杠+s」，sha256 全null。
-
             #     注意 \\*? 末尾的 ? 必须保留，去掉会丢失「二进制模式可选」语义。
-
             ($sums
-
              | split("\n")
-
              | map(select(length > 0)
-
              | capture("^(?<hash>[0-9a-f]{64})\\s+\\*?(?<name>.+)$"))
-
              | map({key: .name, value: .hash})
-
              | from_entries) as $H
-
             | {
-
               schema_version: 1,
-
               repository: $repo,
-
               latest_version: $latest_version,
-
               generated_at: $generated,
-
               assets: (
-
                 [ "linux-arm64", "linux-musl-arm64", "linux-musl-x64", "linux-x64", "win-x64" ]
-
                 | map(. as $rid
-
                     | ("ilspycmd-" + $latest_version + "-" + $rid + ".zip") as $fname
-
                     | {
-
                         rid: $rid,
-
                         url: ($repo + "/releases/download/" + $latest_version + "/" + $fname),
-
                         sha256: ($H[$fname] // null)
-
                       })
-
               ),
-
               license: {
-
                 repository: "MIT",
-
                 upstream: "MIT",
-
                 gcc_runtime_libraries: "GPL-3.0-or-later WITH GCC-exception-3.1",
-
                 gcc_runtime_libraries_scope: "linux-musl-* only",
-
                 _comment: { en: $c_lic_en, "zh-CN": $c_lic }
-
               },
-
               _comment: { en: $c_file_en, "zh-CN": $c_file }
-
             }
-
             ' > latest.json
-
           echo "::group::latest.json 内容"
-
           cat latest.json
-
           echo "::endgroup::"
-
           # 校验：5 个 RID 的 sha256 必须都已填上，不能有 null
-
           NULL_COUNT=$(jq '[.assets[] | select(.sha256 == null)] | length' latest.json)
-
           if [ "$NULL_COUNT" -ne 0 ]; then
-
             echo "::error::latest.json 中有 ${NULL_COUNT} 个资产缺少 sha256"
-
             jq '.assets' latest.json
-
             exit 1
-
           fi
-
           # 校验：latest_version 必须确实存在于 Release 中
-
           if ! printf '%s' "$ALL_JSON" | jq -e --arg t "$BEST_TAG" \
                '.[] | select(.tag_name == $t)' >/dev/null; then
-
             echo "::error::latest.json 指向不存在的 Release: ${BEST_TAG}"
-
             exit 1
-
           fi
-
           {
-
             echo "tag=$BEST_TAG"
-
             echo "url=$TARGET_URL"
-
           } >> "$GITHUB_OUTPUT"
 
       - name: 回写 latest.json 到全部 Release
 
         env:
-
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
           GH_REPO: ${{ github.repository }}
-
           SERVER_URL: ${{ github.server_url }}
-
           UPSTREAM_URL: ${{ needs.check-version.outputs.release_url }}
 
         run: |
 
           set -euo pipefail
-
           ALL_JSON=$(curl -fsS --retry 3 --retry-all-errors \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${GH_REPO}/releases?per_page=100")
-
           TAGS=$(printf '%s' "$ALL_JSON" \
             | jq -r '.[] | select(.draft==false and .prerelease==false) | .tag_name' \
             | grep -E '^v?[0-9]+\.[0-9]+' | sort -u)
-
           TOTAL=$(printf '%s\n' "$TAGS" | grep -c . || true)
-
           # 生成阶段产出的 latest.json 已存在；这里只做上传。
-
           # 注意 latest.json 内容里含上游 release_url，为避免逐 Release
-
           # 重新生成造成不一致，统一复用同一份文件。
 
           # ---- 回写一致性：任何一个 Release 没拿到清单都必须让构建失败----
@@ -3486,11 +2207,8 @@ jobs:
           MISSING=""
           OK=0
           FAIL=0
-
           while IFS= read -r t; do
-
             [ -n "$t" ] || continue
-
             # 单个 Release 也重试 3 次：网络抖动 / API 限流不该让整轮发布失败。
             UPLOAD_OK=0
             UPLOAD_TRY=1
@@ -3504,7 +2222,6 @@ jobs:
               sleep $((UPLOAD_TRY * 5))
               UPLOAD_TRY=$((UPLOAD_TRY + 1))
             done
-
             if [ "$UPLOAD_OK" -eq 1 ]; then
               echo "  [已落] $t"
               LANDED="${LANDED} ${t}"
@@ -3514,16 +2231,13 @@ jobs:
               MISSING="${MISSING} ${t}"
               FAIL=$((FAIL + 1))
             fi
-
           done <<< "$TAGS"
-
           echo
           echo "::group::latest.json 落点对照表"
           echo "候选总数: ${TOTAL}"
           echo "已落(${OK})  :${LANDED:-（无）}"
           echo "未落 (${FAIL}) :${MISSING:-（无）}"
           echo "::endgroup::"
-
           if [ "$FAIL" -ne 0 ]; then
             echo "::error title=latest.json 回写不完整::${FAIL}/${TOTAL} 个 Release 未拿到本次清单：${MISSING}"
             echo "::error::这会造成对外清单不一致：部分 Release 声称的 latest_version 仍是旧版本。"
@@ -3532,6 +2246,5 @@ jobs:
             echo "::error::latest.json 已由上一阶段生成完毕、内容正确，无需重新生成。"
             exit 1
           fi
-
           echo "latest.json 已回写到全部 ${OK} 个 Release"
           echo "::notice::latest.json 回写完整（${OK}/${TOTAL}），清单一致性成立"

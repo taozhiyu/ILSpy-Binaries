@@ -479,7 +479,7 @@ jobs:
             os: ubuntu-24.04
 
           - rid: linux-musl-arm64
-            os: ubuntu-24.04
+            os: ubuntu-24.04-arm
 
           - rid: win-x64
             os: windows-latest
@@ -1215,19 +1215,33 @@ jobs:
 
       # ---------------------------------------------------------------------
 
-      # qemu-user 模拟支持（仅 linux-musl-arm64）
+      # qemu-user 模拟支持（仅 linux-arm64）
 
       #
 
-      # 为什么需要：GitHub runner 是 x86_64，而 linux-musl-arm64 要做两件
+      # 为什么需要：linux-arm64（glibc）的产物是 aarch64 ELF，但它的 matrix
 
-      # 都依赖 aarch64 用户态的事——
+      # runner 仍是 x86_64（ubuntu-24.04），因此真机验证必须靠 qemu-user 提供
 
-      #   1) 从 Alpine 官方仓库取 **aarch64** 的 libstdc++/libgcc；
+      # aarch64 用户态——具体是 debian:bookworm 的 arm64 镜像（glibc 产物不能
 
-      #   2) 在冒烟测试里真正执行 arm64 ELF。
+      # 用 musl 的 Alpine 承载，且 .NET 的加密/证书依赖需要镜像里的 libssl3）。
 
-      # 二者都要求 /proc/sys/fs/binfmt_misc 里注册了 qemu-aarch64。
+      #
+
+      # 【为什么 linux-musl-arm64 已不再走这条路】
+
+      # linux-musl-arm64 已切到**原生 aarch64 runner**（ubuntu-24.04-arm，见
+
+      # matrix.include）。宿主本身就是 aarch64，于是两件依赖 aarch64 用户态的
+
+      # 事都不再需要 binfmt 注册：从 Alpine 取到的库天然是 aarch64，冒烟测试
+
+      # 也天然能执行 arm64 ELF。宿主侧只需一条 uname -m 断言来证明这一点
+
+      # （见真机验证步骤的 musl-arm64 分支）。
+
+      # 实测收益：该腿 493s -> 约 77s，其中模拟开销 416s -> 2s。
 
       #
 
@@ -1261,9 +1275,9 @@ jobs:
 
       # ---------------------------------------------------------------------
 
-      - name: 启用 qemu-user 模拟（所有 arm64 RID）
+      - name: 启用 qemu-user 模拟（仅 linux-arm64）
 
-        if: endsWith(matrix.rid, 'arm64')
+        if: matrix.rid == 'linux-arm64'
 
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
 
@@ -1272,9 +1286,18 @@ jobs:
           platforms: arm64
 
       # ---------------------------------------------------------------------
-      # arm64 模拟可用性探测
+      # arm64 模拟可用性探测（仅 linux-arm64 使用）
       #
-      # 【为什么不能用 `if: endsWith(matrix.rid,'arm64')` 就无条件置 1】
+      # 【适用范围】本探测现在只服务 linux-arm64（glibc）。
+      #   linux-arm64 仍是 x86_64 runner + qemu-user + Debian arm64 镜像，
+      #   所以 QEMU_ARM64 这个开关对它依然有意义，且必须由真实 canary 决定。
+      #   linux-musl-arm64 已切到**原生 aarch64 runner**（见 matrix.include）：
+      #   宿主本身就是 aarch64，qemu 步骤与本探测都不再为它执行，它的架构
+      #   保证改由真机验证步骤 musl-arm64 分支里的「宿主 uname -m 断言」承担。
+      #   因此本步骤的 if 已从 endsWith(rid,'arm64') 收窄为 rid == 'linux-arm64'，
+      #   否则会在这里白跑一次无用的 docker canary（约 20s）。
+      #
+      # 【为什么仍不能用「无条件置 1」】
       # 旧实现只要 RID 以 arm64 结尾就写 QEMU_ARM64=1，从未探测 qemu 是否真的可用。
       # 于是下游 `[ "${QEMU_ARM64:-0}" != "1" ]` 守卫形同虚设：qemu 不可用时
       # 依旧会走进 `docker run --platform linux/arm64` 然后失败，且失败会被
@@ -1292,9 +1315,9 @@ jobs:
       #
       # 失败时置 0（而非留空/置 1），让下游守卫真正起作用。
       # ---------------------------------------------------------------------
-      - name: 探测 arm64 模拟可用性（真实 canary）
+      - name: 探测 arm64 模拟可用性（仅 linux-arm64）
 
-        if: always() && endsWith(matrix.rid, 'arm64')
+        if: always() && matrix.rid == 'linux-arm64'
 
         run: |
           set -uo pipefail
@@ -1400,11 +1423,19 @@ jobs:
 
           # ---- 历史缺陷的根因修复 ----
 
-          # --platform 必须按目标 RID 显式指定。runner 是 x86_64，
+          # --platform 必须按目标 RID 显式指定。对 linux-musl-x64 而言
 
-          # 不指定时 docker 按宿主架构取 x86_64 的包，
+          # runner 是 x86_64，不指定时 docker 按宿主架构取 x86_64 的包，
 
-          # 于是 x86_64 的 .so 被打进 linux-musl-arm64 产物，
+          # 装出的 .so 与 musl-x64 产物架构不符。
+
+          #
+
+          # 【历史缺陷（已修复，保留记录）】此前取库的 docker run 没有
+
+          # --platform，apk 在 x86_64 上执行，拿到的是 **x86_64** 的 .so，
+
+          # 却被原样 cp 进 linux-musl-arm64 产物目录，于是
 
           # 目标机（麒麟 arm64）加载时报
 
@@ -1413,6 +1444,18 @@ jobs:
           # 因为 x86-64 的 R_X86_64_64(1) / R_X86_64_GLOB_DAT(6) 在
 
           # aarch64 下是未定义的重定位编号（aarch64 从 257 起编）。
+
+          # 现由「按 RID 显式 --platform」+「readelf 架构断言」双重保证。
+
+          #
+
+          # linux-musl-arm64 现已改在**原生 aarch64 runner** 上构建，即便
+
+          # 漏写 --platform 也不会再取到错架构的包；但显式声明仍然是必要的
+
+          # ——它是「目标架构」的唯一书面来源，也让 GCC-RUNTIME-LIBRARIES.txt
+
+          # 里的 Fetched-from 记录保持诚实。
 
           #
 
@@ -1436,9 +1479,11 @@ jobs:
 
           #     需要额外解析 APKINDEX，是三者里最脆的一种。
 
-          # 因此采用 docker run --platform + binfmt/qemu（见上方
+          # 因此采用 docker run --platform：linux-musl-x64 在 x86_64 runner 上
 
-          # docker/setup-qemu-action 步骤）。
+          # 取宿主架构的包（amd64，与目标一致）；linux-musl-arm64 则直接
+
+          # 在原生 aarch64 宿主上取 aarch64 的包。
 
           #
 
@@ -1988,11 +2033,13 @@ jobs:
 
       #
 
-      # 现在 linux-musl-arm64 通过 qemu-user 在纯净 Alpine 容器里真正执行。
+      # 【现状】
 
-      # linux-arm64（glibc）与 win-x64 仍无法在此验证（前者需要 glibc
+      #   linux-musl-arm64  已在**原生 aarch64 runner** 的纯净 Alpine 容器中真正执行。
 
-      # 容器 + 模拟，后者是 PE 格式），属于已知缺口，已如实写进 Release 说明。
+      #   linux-arm64（glibc）仍靠 qemu-user 模拟 + Debian arm64 镜像，属已知缺口。
+
+      #   win-x64 已在原生 Windows runner 上实跑（见下），不再是缺口。
 
       #
 
@@ -2029,19 +2076,19 @@ jobs:
           docker run --rm -v "$PWD/out/${RID}:/app:ro" \
             alpine:3 /bin/sh -c 'cd /app && ./ilspycmd --version'
 
-      # arm64 冒烟测试：把「产物缺陷」与「环境不支持」彻底分开。
+      # arm64 冒烟测试（linux-musl-arm64，原生 aarch64）：把「产物缺陷」与「环境不支持」彻底分开。
 
       #
 
       # 做法是两段式：
 
-      #   第 1 段 环境自检（canary）：在同一个 qemu 环境里执行一个
+      #   第 1 段 环境自检（canary）：执行一个已知一定正常的 aarch64 命令
 
-      #           已知一定正常的 aarch64 命令（uname -m），并断言输出
+      #           （容器内 uname -m），并断言输出必须是 aarch64。
 
-      #           必须是 aarch64。这一段失败 => 是 runner 的 qemu/binfmt
+      #           这一段失败 => 是**运行环境**问题，与产物无关
 
-      #           环境问题，与产物无关（产物还没被执行过）。
+      #           （产物还没被执行过）。
 
       #   第 2 段 产物验证：canary 通过后才执行 ilspycmd。此时若失败，
 
@@ -2049,9 +2096,9 @@ jobs:
 
       #
 
-      # 为什么必须先过 canary：没有 binfmt 时，
+      # 为什么必须先过 canary：若 matrix.include 里的 runner 标签被误改成
 
-      # `docker run --platform linux/arm64` 会报 "no matching manifest"
+      # x86_64，`docker run --platform linux/arm64` 会报 "no matching manifest"
 
       # 或 "exec format error"，而产物里的 .so 架构不对时报的是
 
@@ -2061,13 +2108,17 @@ jobs:
 
       #
 
-      # 注意 canary 校验的是 **guest** 架构：这一步同时证明了
+      # 【与切到原生 arm 之前的差别】
 
-      #   (a) qemu 可用，(b) --platform 真的生效了，
+      # 这一段过去证明的是「qemu 可用」；现在宿主本身就是 aarch64，它证明的是
 
-      # 而 (b) 正是上面取库步骤正确性的前提。
+      #   (a) 宿主与容器确实是 aarch64（不是被退回模拟），
 
-      - name: 冒烟测试（linux-musl-arm64，qemu 模拟 aarch64 解压即用验证）
+      #   (b) --platform 声明与实际一致——而 (b) 正是上面取库步骤正确性的前提。
+
+      # 价值没有消失，只是从「模拟可用性」变成了「架构一致性」。
+
+      - name: 冒烟测试（linux-musl-arm64，原生 aarch64 解压即用验证）
 
         if: matrix.rid == 'linux-musl-arm64'
 
@@ -2081,7 +2132,7 @@ jobs:
 
           # ---- 第 1 段：环境自检（canary）----
 
-          echo "::group::环境自检：确认 qemu 可用且 guest 真的是 aarch64"
+          echo "::group::环境自检：确认宿主与容器确实是 aarch64（未退回模拟）"
 
           CANARY_OUT=/tmp/arm64-canary.out
 
@@ -2100,7 +2151,7 @@ jobs:
 
             echo "::endgroup::"
 
-            echo "::error title=环境不支持 / 第 1 段环境自检失败::qemu-user 不可用，无法在 x86_64 runner 上执行 aarch64 容器。这**不是产物缺陷**——产物尚未被执行过。本步骤依赖 docker/setup-qemu-action 向 binfmt_misc 注册 qemu-aarch64（见本 job 前面的 qemu 步骤）。"
+            echo "::error title=环境不支持 / 第 1 段环境自检失败::无法执行 aarch64 容器。这**不是产物缺陷**——产物尚未被执行过。本步骤要求在**原生 aarch64 runner** 上构建 linux-musl-arm64（matrix.include 里应为 ubuntu-24.04-arm），且容器可正常启动。"
 
             exit 1
 
@@ -2114,13 +2165,13 @@ jobs:
 
             echo "::endgroup::"
 
-            echo "::error title=环境不支持 / 第 1 段环境自检失败::容器返回架构 '${CANARY_ARCH}' 而不是 aarch64，说明 --platform linux/arm64 没有真正生效。这**不是产物缺陷**。"
+            echo "::error title=环境不支持 / 第 1 段环境自检失败::容器返回架构 '${CANARY_ARCH}' 而不是 aarch64，说明宿主不是原生 aarch64（matrix.include 的 runner 标签可能被改错），或 --platform linux/arm64 没有真正生效。这**不是产物缺陷**。"
 
             exit 1
 
           fi
 
-          echo "qemu-user 可用，guest 架构确认为 aarch64"
+          echo "宿主与容器架构均确认为 aarch64（原生执行，无模拟）"
 
           echo "::endgroup::"
 
@@ -2134,14 +2185,14 @@ jobs:
 
           RC=0
 
-          # timeout 900：.NET self-contained 在 qemu 模拟下冷启动很慢，
-
-          # 900s 是宽松上限；busybox 自带 timeout，无需额外安装。
+          # timeout 600：原生 aarch64 上实测三级验证仅耗 2s，600s 是极宽松上限；
+          # 保留超时是为了防止 .NET 运行时异常时挂死整个 job。
+          # busybox 自带 timeout，无需额外安装。
 
           # 产物目录只读挂载（:ro），确保测的是"解压即用"而非可写环境的假象。
 
           docker run --rm --platform linux/arm64 -v "$PWD/${OUT_DIR}:/app:ro" \
-            alpine:3 /bin/sh -c 'cd /app && timeout 900 ./ilspycmd --version' \
+            alpine:3 /bin/sh -c 'cd /app && timeout 600 ./ilspycmd --version' \
             > "${SMOKE_OUT}" 2> "${SMOKE_ERR}" || RC=$?
 
           echo "--- stdout ---"
@@ -2164,13 +2215,13 @@ jobs:
 
             fi
 
-            echo "linux-musl-arm64 在模拟 aarch64 的纯净 Alpine 中运行成功（qemu-user）"
+            echo "linux-musl-arm64 在原生 aarch64 的纯净 Alpine 中运行成功（无模拟）"
 
             exit 0
 
           fi
 
-          # ---- 失败分类：区分「产物缺陷」与「环境/模拟限制」 ----
+          # ---- 失败分类：区分「产物缺陷」与「环境限制」 ----
 
           # 判定依据（按特异性从高到低）：
 
@@ -2180,13 +2231,13 @@ jobs:
 
           #      未定义编号（aarch64 从 257 起编），只有 x86_64 的 .so 才会
 
-          #      触发。canary 已证明 guest 确实是 aarch64，故为产物缺陷。
+          #      触发。canary 已证明容器确实是 aarch64，故为产物缺陷。
 
           #   2) Error loading shared library => 缺库或 RPATH 未生效，产物缺陷。
 
-          #   3) 镜像/模拟层报错 => 环境不支持。
+          #   3) 镜像/容器层报错 => 环境不支持。
 
-          #   4) 其它（含模拟下的超时/崩溃）=> 证据不足，标注清楚后同样
+          #   4) 其它（含超时/崩溃）=> 证据不足，标注清楚后同样
 
           #      阻断发布，避免把不确定的东西当"已验证"放出去。
 
@@ -2208,7 +2259,7 @@ jobs:
             echo "::error title=环境不支持::qemu/binfmt 在真正执行产物时失败。产物本身未被证伪，但本次构建拿不到运行验证证据。"
             exit 1
           fi
-          echo "::error title=证据不足 / 疑似 qemu 模拟限制::在 qemu 模拟 aarch64 下运行失败，且 stderr 不匹配任何已知特征。请人工查看上方完整日志判断是产物缺陷还是模拟限制。为保证发布包可验证，本次构建按失败处理。"
+          echo "::error title=证据不足 / 疑似 arm64 运行环境限制::在原生 aarch64 上运行失败，且 stderr 不匹配任何已知特征。请人工查看上方完整日志判断是产物缺陷还是环境限制。为保证发布包可验证，本次构建按失败处理。"
           exit 1
       # =================================================================
       # 真机验证（全部平台）：L1 -h / L2 --version / L3 真实反编译 + 产物内容断言
@@ -2231,7 +2282,7 @@ jobs:
       #   linux-x64          runner 原生执行
       #   linux-arm64        qemu-user(aarch64) + Debian arm64 镜像（产物是 glibc 的）
       #   linux-musl-x64     纯净 Alpine 容器
-      #   linux-musl-arm64   qemu-user + 纯净 Alpine arm64 容器
+      #   linux-musl-arm64   原生 aarch64 runner + 纯净 Alpine arm64 容器（宿主即 aarch64，无 qemu）
       #   win-x64            runner 原生执行（windows-latest，直接跑 ilspycmd.exe）
       #
       # 【失败分类】产物缺陷与环境不支持必须区分开（标题不同、排查方向不同），
@@ -2486,8 +2537,8 @@ jobs:
             local log="$2"
             shift 2
             local rc=0
-            # 宿主侧兜底超时：容器内路径各自已有 timeout（amd64 用 600、
-            # qemu 路径用 1800），但 native 与 windows 两路是直接在宿主上
+            # 宿主侧兜底超时：容器内路径各自已有 timeout（linux-musl-* 用 600、
+            # 仅 linux-arm64 的 qemu 路径用 1800），但 native 与 windows 两路是直接在宿主上
             # 执行的，其中 windows 那一腿要在 PE 上跑起 .NET self-contained 运行时
             #耗时不可控。缺超时的话一旦挂死会烧到 GitHub 6 小时 job 上限。
             # 2400s 是宽松上限：超过即判定失败，仍由下方分类逻辑归因。
@@ -2560,11 +2611,13 @@ jobs:
                   '
               ;;
             musl-arm64)
-              if [ "${QEMU_ARM64:-0}" != "1" ]; then
-                envfail "arm64 模拟探测未通过（QEMU_ARM64=${QEMU_ARM64:-未设置}），linux-musl-arm64 未取得任何运行证据"
-                echo "::notice::此时仅「架构断言（readelf -h）」生效：包内 ELF 架构已确认正确，但「能否运行」无证据。"
+              # 原生 arm64 runner：守卫从「qemu 是否可用」换成「宿主是否真的是 aarch64」。
+              # 这条腿已不走 qemu，QEMU_ARM64 永远不会被写入，沿用旧守卫会必然失败。
+              if [ "$(uname -m)" != "aarch64" ]; then
+                envfail "预期在原生 aarch64 runner 上构建 linux-musl-arm64，实际宿主架构为 $(uname -m)"
+                echo "::notice::宿主架构不对，说明 matrix.include 的 runner 标签被改错了（应为 ubuntu-24.04-arm）。"
               else
-                # --platform 必须显式指定，否则容器是 x86_64，验证就失去意义。
+                # 显式传 --platform 保持意图明确，并顺带证明宿主与目标一致。
                 run_and_classify "linux-musl-arm64 容器内三级验证" /tmp/verify-musl-arm64.log \
                   docker run --rm --platform linux/arm64 \
                     -v "${ABS_OUT}:/app:ro" \
@@ -2573,11 +2626,11 @@ jobs:
                       set -u
                       if [ "$(uname -m)" != "aarch64" ]; then
                         echo "VERIFY_RESULT=ENV_UNSUPPORTED"
-                        echo "  guest 架构是 $(uname -m)，不是 aarch64，--platform 未生效"
+                        echo "  容器架构是 $(uname -m)，不是 aarch64，宿主或 --platform 有问题"
                         exit 1
                       fi
-                      # timeout 1800：qemu 模拟下冷启动很慢，见上面 qemu-glibc 分支的同类说明。
-                      exec timeout 1800 sh /smoke/run_checks.sh /app/ilspycmd /app /smoke/out/SmokeTarget.dll /tmp/decompiled
+                      # timeout 600：原生 aarch64 上实测三级验证仅耗 2s，600s 是极宽松上限。
+                      exec timeout 600 sh /smoke/run_checks.sh /app/ilspycmd /app /smoke/out/SmokeTarget.dll /tmp/decompiled
                     '
               fi
               ;;
@@ -2857,9 +2910,9 @@ jobs:
 
             Please verify downloads against the checksums in `SHA256SUMS`.
 
-            > 说明 / Note：**全部 5 个平台**（linux-x64、linux-arm64、linux-musl-x64、linux-musl-arm64、win-x64）在发布前都通过了三级验证：**L1** `-h`、**L2** `--version`、**L3** 对一个真实 demo 程序集的反编译，**且校验反编译产物内容**（必须生成 `.cs` 并包含预期类型/成员）。Linux 产物另做「解压即用」验证（纯净容器内不设 `LD_LIBRARY_PATH`），arm64 经 `qemu-user` 模拟 aarch64 执行，并对包内**每一个 ELF** 做架构断言（`readelf -h`）；Windows 产物在**原生 Windows runner** 上直接实跑。**任一环节失败即中止，不产出 Release。**
+            > 说明 / Note：**全部 5 个平台**（linux-x64、linux-arm64、linux-musl-x64、linux-musl-arm64、win-x64）在发布前都通过了三级验证：**L1** `-h`、**L2** `--version`、**L3** 对一个真实 demo 程序集的反编译，**且校验反编译产物内容**（必须生成 `.cs` 并包含预期类型/成员）。Linux 产物另做「解压即用」验证（纯净容器内不设 `LD_LIBRARY_PATH`）：`linux-musl-arm64` 在**原生 aarch64 runner** 上执行，`linux-arm64`（glibc）经 `qemu-user` 模拟 aarch64 执行，并对包内**每一个 ELF** 做架构断言（`readelf -h`）；Windows 产物在**原生 Windows runner** 上直接实跑。**任一环节失败即中止，不产出 Release。**
 
-            > **All five platforms** (linux-x64, linux-arm64, linux-musl-x64, linux-musl-arm64, win-x64) pass a three-stage verification before release: **L1** `-h`, **L2** `--version`, and **L3** an actual decompilation of a real demo assembly whose **output content is asserted** (a `.cs` file must be produced and contain the expected types/members). Linux artifacts additionally verify "runs straight after extraction" inside a clean container (no `LD_LIBRARY_PATH`); arm64 is executed under `qemu-user` aarch64 emulation with an architecture assertion (`readelf -h`) over **every** ELF in the archive; the Windows artifact is executed on a **native Windows runner**. **Any failing stage aborts the workflow — no Release is produced.**
+            > **All five platforms** (linux-x64, linux-arm64, linux-musl-x64, linux-musl-arm64, win-x64) pass a three-stage verification before release: **L1** `-h`, **L2** `--version`, and **L3** an actual decompilation of a real demo assembly whose **output content is asserted** (a `.cs` file must be produced and contain the expected types/members). Linux artifacts additionally verify "runs straight after extraction" inside a clean container (no `LD_LIBRARY_PATH`): `linux-musl-arm64` is executed on a **native aarch64 runner**, while `linux-arm64` (glibc) is executed under `qemu-user` aarch64 emulation; an architecture assertion (`readelf -h`) over **every** ELF in the archive applies to all of them; the Windows artifact is executed on a **native Windows runner**. **Any failing stage aborts the workflow — no Release is produced.**
 
             > ### 自动更新：`latest.json`
 
@@ -2874,6 +2927,10 @@ jobs:
             > 该地址与版本无关，长期有效。以 `_` 开头的键为注释项，客户端可安全忽略。
 
             > This release ships `latest.json`, which lists the absolute URL and SHA-256 of every asset. `latest_version` is resolved by **SemVer comparison across all release tags**, deliberately NOT by publication time: GitHub's own `releases/latest` ranks by publication time and would wrongly point at `v10.0` if `v11.0` were published first. Always trust `latest.json`. Keys prefixed with `_` are comments and may be ignored.
+
+            > **格式变更（破坏性）/ Breaking format change**：`latest.json` 已精简为 `schema_version` / `repository` / `latest_version` / `generated_at` / `assets[]` / `license` / `_comment`。移除了 `upstream_version`、`upstream_repository`、`upstream_release_url`、`version_resolution`、`checksum_source`、`checksums`，以及 `assets[].file`（文件名可由 `url` 直接取）。`latest_version`、`assets[].rid/url/sha256` 的语义与位置**未变**。若你的客户端读取过上述被移除的字段，请改用 `url` 与 `assets[].sha256`。
+
+            > **Breaking format change**: `latest.json` has been slimmed down to `schema_version` / `repository` / `latest_version` / `generated_at` / `assets[]` / `license` / `_comment`. The fields `upstream_version`, `upstream_repository`, `upstream_release_url`, `version_resolution`, `checksum_source`, `checksums` and `assets[].file` have been **removed** (the file name is directly derivable from `url`). The meaning and location of `latest_version` and `assets[].rid/url/sha256` are **unchanged**. If your client read any of the removed fields, use `url` and `assets[].sha256` instead.
 
             > musl 包说明 / musl packages：`ilspycmd` 的 ELF 依赖 `libstdc++.so.6` 与 `libgcc_s.so.1`（self-contained 只打包 .NET 运行时，不含GCC 运行库）。为实现解压即用，`linux-musl-*` 包内已随附这两个库，并为所有相关二进制注入了 `RPATH=$ORIGIN`。它们来自 Alpine 官方仓库的 `libstdc++` / `libgcc` 包，按 **`GPL-3.0-or-later WITH GCC-exception-3.1`** 许可分发（注意：GCC Runtime Library Exception 是叠加在 GPL 之上的附加许可，并非独立许可证）；包内 `LICENSE-GCC-RUNTIME-LIBRARY.txt` 内嵌了 GPLv3 与该例外的**完整正文**。版本清单见 `GCC-RUNTIME-LIBRARIES.txt`。若你的系统已提供这两个库，可安全删除包内副本。
 
@@ -3244,12 +3301,11 @@ jobs:
           jq -n \
             --arg repo "$SERVER_URL/${GH_REPO}" \
             --arg latest_version "$BEST_TAG" \
-            --arg upstream_repo "https://github.com/${UPSTREAM_REPO}" \
-            --arg upstream_url "$UPSTREAM_URL" \
-            --arg upstream_tag "$BEST_TAG" \
-            --arg compared "$COMPARED" \
             --arg generated "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-            --arg sums_source "$CHECKSUM_SOURCE" \
+            --arg c_file $'本文件由 GitHub Actions 自动生成，请勿手工编辑。\nlatest_version 是按 SemVer 数值比较得出的最大版本，不是发布时间最新的版本。' \
+            --arg c_file_en $'This file is generated automatically by GitHub Actions; do not edit manually.\nlatest_version is the version with the greatest SemVer value, not the most recently published one.' \
+            --arg c_lic $'repository 指本仓库原创文件；upstream 指随包分发的 ILSpy 二进制。仅 linux-musl-* 包额外包含 GCC 运行时库。' \
+            --arg c_lic_en $'"repository" refers to the original files in this repository; "upstream" refers to the ILSpy binaries distributed with the packages. Only the linux-musl-* packages additionally bundle the GCC runtime libraries.' \
             --rawfile sums "$SUMS_FILE" \
             '
 
@@ -3299,27 +3355,7 @@ jobs:
 
               latest_version: $latest_version,
 
-              upstream_version: $upstream_tag,
-
-              upstream_repository: $upstream_repo,
-
-              upstream_release_url: $upstream_url,
-
               generated_at: $generated,
-
-              version_resolution: {
-
-                method: "semver",
-
-                _comment: "method=semver 表示 latest_version 由 SemVer 数值比较得出，未使用发布时间。GitHub 内置的 releases/latest 按发布时间选取，在先发 v11.0 后发 v10.0 时会错误地指向 v10.0，故本文件不采信它。",
-
-                compared_tags: ($compared | split(",") | map(select(length > 0))),
-
-                excluded_drafts: true,
-
-                excluded_prereleases: true
-
-              },
 
               assets: (
 
@@ -3333,8 +3369,6 @@ jobs:
 
                         rid: $rid,
 
-                        file: $fname,
-
                         url: ($repo + "/releases/download/" + $latest_version + "/" + $fname),
 
                         sha256: ($H[$fname] // null)
@@ -3343,35 +3377,21 @@ jobs:
 
               ),
 
-              checksum_source: $sums_source,
-
-              checksums: {
-
-                file: "SHA256SUMS",
-
-                url: ($repo + "/releases/download/" + $latest_version + "/SHA256SUMS"),
-
-                _comment: "sha256 取自该版本的 SHA256SUMS，与 assets[].sha256 同源。"
-
-              },
-
               license: {
 
                 repository: "MIT",
 
                 upstream: "MIT",
 
-                _comment: "repository 指本仓库原创文件；upstream 指随包分发的 ILSpy 二进制。仅 linux-musl-* 包额外包含 GCC 运行时库。",
-
                 gcc_runtime_libraries: "GPL-3.0-or-later WITH GCC-exception-3.1",
 
-                gcc_runtime_libraries_scope: "linux-musl-* only"
+                gcc_runtime_libraries_scope: "linux-musl-* only",
+
+                _comment: { en: $c_lic_en, "zh-CN": $c_lic }
 
               },
 
-              _comment_version: "本文件由 GitHub Actions 自动生成，请勿手工编辑。",
-
-              _comment_latest: "latest_version 是按 SemVer 解析出的最大版本，不是发布时间最新的版本。"
+              _comment: { en: $c_file_en, "zh-CN": $c_file }
 
             }
 

@@ -77,9 +77,8 @@ name: Build & Release ilspycmd (self-contained)
 # ---------------------------------------------------------------------------
 
 on:
-
   schedule:
-    - cron: '0 3 * * *'
+    - cron: '6 2 * * 5'
   workflow_dispatch:
     inputs:
       force_version:
@@ -98,7 +97,6 @@ on:
 # ===========================================================================
 
 permissions:
-
   contents: read
 # ===========================================================================
 # 安全加固 2：并发锁
@@ -117,7 +115,6 @@ env:
   RID_LIST: "linux-arm64 linux-musl-arm64 linux-musl-x64 linux-x64 win-x64"
 
 jobs:
-
   # ---------------------------------------------------------------------
   # 第 1 步：检测上游版本 -> 解析 commit SHA -> 校验本仓库资产是否齐全
   # ---------------------------------------------------------------------
@@ -134,7 +131,6 @@ jobs:
     steps:
 
       - name: 检测上游版本并校验本仓库资产完整性
-
         id: detect
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -251,8 +247,7 @@ jobs:
         #
         # win-x64 走**原生 Windows runner**：GitHub Actions 本来就提供
         # windows runner，用 Linux + wine 模拟跑 PE 是自找麻烦——wine 对
-        # .NET self-contained PE 的支持并不完整，且已为此绕过两轮
-        #（先把 wine 改成 wine64，再修 wine64 的安装路径）。
+        # .NET self-contained PE 的支持并不完整
         include:
           - rid: linux-x64
             os: ubuntu-24.04
@@ -285,7 +280,6 @@ jobs:
     steps:
 
       - name: 检出 ILSpy 源码（按 commit SHA，不保留凭据）
-
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: icsharpcode/ILSpy
@@ -299,7 +293,6 @@ jobs:
       # ref 用触发本次构建的分支/提交，保证包内文档与构建来源一致。
 
       - name: 检出本仓库说明文档与许可证正文
-
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           sparse-checkout: |
@@ -358,7 +351,6 @@ jobs:
       # zip(linux) / 7z(windows)，并各自给出明确报错。
       # ---------------------------------------------------------------------
       - name: Windows 腿工具预检
-
         if: runner.os == 'Windows'
         shell: bash
         run: |
@@ -379,9 +371,7 @@ jobs:
           echo "dotnet --version: $(dotnet --version 2>/dev/null || echo '<读不到>')"
           echo "工具预检通过"
 
-
       - name: 清理 global.json 里的 SDK 版本锁定
-
         working-directory: ilspy-src
         shell: bash
         run: |
@@ -398,7 +388,6 @@ jobs:
           fi
 
       - name: 安装 .NET SDK（四套，冻结配方）
-
         uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6
         with:
           dotnet-version: |
@@ -421,23 +410,6 @@ jobs:
           cache-dependency-path: |
             ilspy-src/**/*.csproj
             ilspy-src/**/packages.lock.json
-
-          # 【为什么开缓存】restore 是本 workflow 最慢的一步，
-          # 且 5 个 RID 每次都要重新解析依赖树并回源。
-          # NuGet 全局包目录跨 job、跨 runner 复用，收益最大且无副作用：
-          # 它只是「包已下载过」的事实记录，不改变依赖解析结果。
-          #
-          # 【为什么锁文件变化会导致失效，这是期望行为】
-          # 本 step 显式传 -p:RestoreLockedMode=false（见Restore 步骤注释：
-          # 上游 csproj 硬编码 RestoreLockedMode=true，而 lock 文件的 RID 段
-          # 固定为 win-x64;win-arm64;linux-x64;osx-arm64，单 RID 传入必然 NU1004）。
-          # 也就是说**锁定校验本来就没在生效**，缓存不会「让 locked 校验被跳过」——
-          # 它从来就没跑过。缓存只影响包的下载与否，不影响版本解析。
-          #
-          # 【为什么不缓存 out/】self-contained 产物与 RID/平台强绑定：
-          # win-x64 的产物在 ubuntu 上无法执行，反之亦然；且 5 条腿并发写同一个
-          # 缓存键会互相覆盖。产物缓存收益低、污染风险高，故只缓存 NuGet 包。
-          #
           # 【缓存不作用于哪些 job】
           #   build            : 用（restore 在这里，最耗时）
           #   check-version    : 不涉及 restore，无需缓存
@@ -583,11 +555,6 @@ jobs:
       #   - 本次构建的来源信息（tag / commit / SDK / 构建时间），
       #     便于使用者追溯这个二进制到底由哪份源码构建而来
       #
-      # 注意：ilspycmd 的 csproj 里有 <None Include="README.md" Pack="true" />，
-      # 那是给 NuGet 包用的，self-contained publish 不会把它复制到输出目录，
-      # 因此这里显式复制，并重命名为 README-UPSTREAM.md 以免与本仓库
-      # 的 README.md 混淆。
-      #
       # 【合规要点】MIT 只要求"随副本附带版权声明"，因此上游 LICENSE 足够。
       # 但 ilspycmd 依赖 NuGet.Protocol / McMaster.Extensions.Hosting.CommandLine
       # 等 Apache-2.0 组件，Apache-2.0 第 4 条要求保留 NOTICE/归属声明，
@@ -633,13 +600,9 @@ jobs:
           done
           if [ -n "$UPSTREAM_README" ]; then
             cp "$UPSTREAM_README" "$OUT_DIR/README-UPSTREAM.md"
-
             echo "已复制上游说明文档: $UPSTREAM_README -> README-UPSTREAM.md"
-
             DOCS=$((DOCS + 1))
-
           else
-
             echo "::warning::未找到上游 ilspycmd 的 README.md"
 
           fi
@@ -711,14 +674,6 @@ jobs:
       # aarch64 用户态——具体是 debian:bookworm 的 arm64 镜像（glibc 产物不能
       # 用 musl 的 Alpine 承载，且 .NET 的加密/证书依赖需要镜像里的 libssl3）。
       #
-      # 【为什么 linux-musl-arm64 已不再走这条路】
-      # linux-musl-arm64 已切到**原生 aarch64 runner**（ubuntu-24.04-arm，见
-      # matrix.include）。宿主本身就是 aarch64，于是两件依赖 aarch64 用户态的
-      # 事都不再需要 binfmt 注册：从 Alpine 取到的库天然是 aarch64，冒烟测试
-      # 也天然能执行 arm64 ELF。宿主侧只需一条 uname -m 断言来证明这一点
-      # （见真机验证步骤的 musl-arm64 分支）。
-      # 实测收益：该腿 493s -> 约 77s，其中模拟开销 416s -> 2s。
-      #
       # 历史缺陷（本次修复的根因）：此前取库的 docker run 没有 --platform，
       # apk 在 x86_64 上执行，拿到的是 **x86_64** 的 .so，却被原样 cp 进
       # linux-musl-arm64 产物目录，再给所有 ELF 注入 RPATH=$ORIGIN。
@@ -728,24 +683,17 @@ jobs:
       #   Error relocating ...: unsupported relocation type 6
       # （x86-64 的 R_X86_64_64=1、R_X86_64_GLOB_DAT=6 在 aarch64 下是
       #   未定义编号，aarch64 的动态重定位从 257 起编）
-
       # 于是解包 Database 阶段返回非 0 状态码，stderr 刷出约 28 万行。
-
       # 现在由「按 RID 显式 --platform」+「readelf 架构断言」双重保证。
-
       #
       # 只装 arm64：默认的 platforms: all 会额外拉取并注册 arm、ppc、
       # s390x、riscv64 等一堆用不到的处理器，显著拖慢每个 matrix job。
       # ---------------------------------------------------------------------
 
       - name: 启用 qemu-user 模拟（仅 linux-arm64）
-
         if: matrix.rid == 'linux-arm64'
-
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
-
         with:
-
           platforms: arm64
 
       # ---------------------------------------------------------------------

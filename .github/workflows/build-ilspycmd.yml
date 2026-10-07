@@ -2239,9 +2239,17 @@ jobs:
               docker run --rm --platform linux/arm64 \
                 -v "$(pwd)/${OUT_DIR}:/app:ro" \
                 -v "$(pwd)/smoke/out:/smoke:ro" \
-                debian:bookworm-slim /bin/sh -c '
+                debian:bookworm /bin/sh -c '
                   set -e
                   echo "容器架构: $(uname -m)"
+                  # .NET 的加密/证书依赖 libssl。debian 基础镜像默认不带，
+                  # 缺它时 L3 真实反编译会在加载阶段报
+                  # "No usable version of libssl was found" 而失败——
+                  # 那是环境缺依赖，不是产物缺陷，故此处显式安装。
+                  apt-get update -qq >/dev/null 2>&1 || true
+                  apt-get install -y -qq --no-install-recommends libssl3 >/dev/null 2>&1 \
+                    || apt-get install -y -qq --no-install-recommends libssl1.1 >/dev/null 2>&1 \
+                    || echo "::notice::libssl 安装失败，L3 可能因环境依赖缺失而失败"
                   cd /tmp
                   echo "--- L1 -h ---"
                   /app/ilspycmd -h >/dev/null
@@ -2319,18 +2327,32 @@ jobs:
                 SKIP_EXEC=1
               fi
               chmod +x "${OUT_DIR}/ilspycmd.exe" 2>/dev/null || true
-              # wine 下运行 PE，产物目录挂到 Z: 盘
-              WIN_OUT="$(echo "${OUT_DIR}" | sed 's|^/home/runner/work/||; s|^/||; s|^|Z:\\\\|; s|/|\\\\|g')"
-              WIN_SMOKE="$(echo "$(pwd)/smoke/out" | sed 's|^/home/runner/work/||; s|^/||; s|^|Z:\\\\|; s|/|\\\\|g')"
-              wine "${OUT_DIR}/ilspycmd.exe" -h > /dev/null 2>&1 \
-                && note "L1 -h: 通过" \
-                || fail "L1 -h: 失败（wine 执行 PE 异常）"
-              wine "${OUT_DIR}/ilspycmd.exe" --version 2>/dev/null | head -1 \
-                && note "L2 --version: 通过" \
-                || fail "L2 --version: 失败"
-              wine "${OUT_DIR}/ilspycmd.exe" -r "${WIN_OUT}" "${WIN_SMOKE}\\SmokeTarget.dll" \
-                && note "L3 反编译: 通过" \
-                || fail "L3 反编译: 失败"
+              # wine 能直接接受 Unix 绝对路径（内部自动映射到 Z: 盘），
+              # 手工拼 Z:// 反而会因工作目录层级算错而找不到文件。
+              chmod +x "${OUT_DIR}/ilspycmd.exe" 2>/dev/null || true
+              ABS_OUT="$(cd "${OUT_DIR}" && pwd)"
+              ABS_SMOKE="$(cd "$(pwd)/smoke/out" && pwd)"
+
+              if wine "${OUT_DIR}/ilspycmd.exe" -h >/dev/null 2>&1; then
+                note "L1 -h: 通过"
+              else
+                fail "L1 -h: 失败（wine 执行 PE 异常）"
+              fi
+
+              # 注意：不能写成 `wine ... | head -1`，管道的退出码取自 head，
+              # 会把 wine 的失败伪装成成功。
+              if wine "${OUT_DIR}/ilspycmd.exe" --version >/tmp/ilspy-ver.txt 2>/dev/null; then
+                note "L2 --version: 通过（$(head -1 /tmp/ilspy-ver.txt)）"
+              else
+                fail "L2 --version: 失败"
+              fi
+
+              if wine "${OUT_DIR}/ilspycmd.exe" -r "${ABS_OUT}" "${ABS_SMOKE}/SmokeTarget.dll" \
+                   >/tmp/ilspy-l3.txt 2>&1; then
+                note "L3 反编译: 通过"
+              else
+                fail "L3 反编译: 失败（wine 报错：$(tail -2 /tmp/ilspy-l3.txt | tr "\n" " ")）"
+              fi
               ;;
           esac
 

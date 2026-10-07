@@ -21,6 +21,7 @@ The published archives are built as **self-contained**, so the target machine do
 * Self-contained publishing, with the .NET runtime bundled
 * Target machines need neither the .NET SDK nor the .NET Runtime
 * Supports Linux x64, Linux ARM64, Windows x64, and additionally provides Linux musl builds
+* For different builds, automate the validation of `-h`, `--version`, and **real** DLL decompilation
 * Automatically produces ZIP archives and creates a GitHub Release
 * Every release ships a machine-readable `latest.json` manifest with absolute download URLs and SHA-256 per platform
 * No long-lived ILSpy source fork has to be maintained
@@ -29,7 +30,7 @@ The published archives are built as **self-contained**, so the target machine do
 
 Each upstream ILSpy release is built into the following targets by default:
 
-| Platform | Architecture / Runtime| RID                |
+| Platform | Architecture / Runtime| RID                 |
 | -------- | --------------------- | ------------------- |
 | Linux    | ARM64                 | `linux-arm64`       |
 | Linux    | ARM64 / musl          | `linux-musl-arm64`  |
@@ -55,6 +56,7 @@ Each release contains the following assets:
 | Linux ARM64 (musl)              | `ilspycmd-<TAG>-linux-musl-arm64.zip`    |
 | Windows x64| `ilspycmd-<TAG>-win-x64.zip`             |
 | Checksums for all of the above  | `SHA256SUMS`                             |
+| current latest version            | `latest.json` |
 
 `<TAG>` is the upstream ILSpy release tag, for example `v11.1`.
 
@@ -72,9 +74,8 @@ This URL does not change between releases, so it is safe to hard-code.
 
 > **Note: the version in `latest` is resolved by SemVer, not by publication time.**
 >
-> GitHub's own `releases/latest` points to the most recently *published*
-> non-draft, non-prerelease release. If `v11.0` is published first and `v10.0`
-> second, GitHub will point `latest` at `v10.0`, which is semantically wrong.
+> If `v11.0` is published first and `v10.0` second, 
+> GitHub might point `latest` at `v10.0`, which is semantically wrong.
 > Therefore the `latest_version` recorded in this project's `latest.json` is
 > determined by **SemVer comparison across all release tags**, and is independent
 > of publication time. See [Version Selection Rules](#version-selection-rules).
@@ -114,20 +115,6 @@ Structure of `latest.json`:
   }
 }
 ```
-
-Keys beginning with an underscore are comment fields and may be safely ignored by clients.
-
-> **Breaking format change.** `latest.json` was slimmed down to the fields shown
-> above. The previously documented `upstream_version`, `upstream_repository`,
-> `upstream_release_url`, `version_resolution`, `checksum_source`, `checksums`
-> and `assets[].file` entries have been **removed**; the asset file name is
-> directly derivable from `url`. The meaning and location of `latest_version`
-> and of each asset's `rid` / `url` / `sha256` are **unchanged**. Clients that
-> read any removed field should use `url` and `assets[].sha256` instead.
->
-> Note that `assets` is an **array** (not an object keyed by RID), and there is
-> no `size` field — use `Content-Length` from the download response if a size is
-> needed.
 
 Command-line example:
 
@@ -268,10 +255,6 @@ The `latest_version` recorded in `latest.json` is determined as follows:
 This guarantees that even if `v11.0` is published before `v10.0`, `latest.json`
 still correctly points at `v11.0`.
 
-> This rule differs from GitHub's built-in `releases/latest` semantics, which ranks
-> by publication time and would therefore point at `v10.0` in the scenario above.
-> Always rely on `latest.json` instead.
-
 ## Self-Contained Builds
 
 This project uses .NET self-contained publishing.
@@ -287,21 +270,12 @@ dotnet publish \
 
 The build output therefore contains the .NET runtime required to run ILSpy.
 
-End users generally do not need to install any of the following:
-
-```text
-.NET SDK
-.NET Runtime
-```
+End users generally do not need to install any of the following: `.NET SDK / Runtime`
 
 Usage is essentially:
 
 ```text
-Download the ZIP
-   ↓
-Extract
-   ↓
-Run ilspycmd
+Download the ZIP ➡️ Extract ➡️ Run ilspycmd
 ```
 
 The target operating system and its native dependency requirements still have to be satisfied.
@@ -311,15 +285,13 @@ The target operating system and its native dependency requirements still have to
 This repository provides both regular Linux and musl Linux builds:
 
 ```text
-linux-x64
-linux-arm64
+linux-x64 + linux-arm64
 ```
 
 as well as:
 
 ```text
-linux-musl-x64
-linux-musl-arm64
+linux-musl-x64 + linux-musl-arm64
 ```
 
 ILSpy is a desktop GUI application and relies on native components such as Avalonia and SkiaSharp. Therefore:
@@ -350,11 +322,9 @@ To make the archives usable immediately after extraction, every `linux-musl-*` a
 | `libstdc++.so.6` | ~2.7 MB | C++ standard library          |
 | `libgcc_s.so.1` | ~170 KB | GCC low-level runtime         |
 
-Both files come from the Alpine Linux `libstdc++` and `libgcc` packages.
+If your system already provides these two libraries, the copies inside the package are not used and can be safely deleted.
 
 > Licensing details, including the exact applicable license expressions and the redistribution conditions, are described in the "Bundled GCC Runtime Libraries" section of [License](#license).
-
-If your system already provides these two libraries, the copies inside the package are not used and can be safely deleted.
 
 ## Archive Contents
 
@@ -372,8 +342,7 @@ Each published ZIP archive contains:
 | `LICENSE-GCC-RUNTIME-LIBRARY.txt` | GCC runtime library licensing, full texts (musl packages only)   |
 | `GCC-RUNTIME-LIBRARIES.txt`       | Bundled GCC library versions (musl packages only)           |
 
-`LICENSE-GCC-RUNTIME-LIBRARY.txt` contains the **full text** of the GPLv3 and of
-the GCC Runtime Library Exception 3.1, rather than links only.
+`LICENSE-GCC-RUNTIME-LIBRARY.txt` contains the **full text** of the GPLv3 and of the GCC Runtime Library Exception 3.1.
 
 ## Versioning
 

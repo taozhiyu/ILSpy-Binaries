@@ -6,9 +6,9 @@
 [![构建状态](https://img.shields.io/github/actions/workflow/status/taozhiyu/ILSpy-Binaries/build-ilspycmd.yml?branch=main&label=build)](https://github.com/taozhiyu/ILSpy-Binaries/actions/workflows/build-ilspycmd.yml)
 [![许可证](https://img.shields.io/github/license/taozhiyu/ILSpy-Binaries?label=license)](https://github.com/taozhiyu/ILSpy-Binaries/blob/main/LICENSE)
 
-English | [简体中文](README.zh.md)
+[English](README.md) | 简体中文
 
-本仓库自动跟踪上游 ILSpy 项目的最新稳定版本，在 GitHub Actions 中为多个平台和架构进行构建，将每个平台的构建结果打包为独立 ZIP，并自动发布到 GitHub Releases。
+本仓库自动跟踪上游 `ILSpy` 项目的最新稳定版本，在 GitHub Actions 中为多个平台和架构进行构建，将每个平台的构建结果打包为独立 ZIP，并自动发布到 GitHub Releases。
 
 生成的安装包采用 **Self-contained（自包含）** 方式发布，目标设备无需额外安装 .NET SDK 或 .NET Runtime 即可运行。
 
@@ -20,6 +20,7 @@ English | [简体中文](README.zh.md)
 * 上游发布新稳定版后自动构建
 * 使用 Self-contained 方式发布，目标设备无需安装 .NET SDK / Runtime
 * 支持 Linux x64、Linux ARM64、Windows x64 等平台，并提供 Linux musl 构建
+* 对于不同构建，自动化校验`-h`、`--version`、**真实**反编译dll
 * 自动生成 ZIP 安装包并创建 GitHub Release
 * 每个 Release 均附带 `latest.json` 机器可读清单，含各平台绝对下载地址与 SHA-256
 * 无需维护 ILSpy 源码 Fork
@@ -28,8 +29,8 @@ English | [简体中文](README.zh.md)
 
 每个上游 ILSpy Release 默认构建以下目标：
 
-| 平台      | 架构 / 运行环境    | RID              |
-| ------- | ------------ | --------------- |
+| 平台    | 架构 / 运行环境 | RID              |
+| ------- | ------------ | ------------------ |
 | Linux   | ARM64        | `linux-arm64`      |
 | Linux   | ARM64 / musl | `linux-musl-arm64` |
 | Linux   | x64 / musl   | `linux-musl-x64`   |
@@ -54,7 +55,8 @@ English | [简体中文](README.zh.md)
 | Linux x64 (musl, 如 Alpine) | `ilspycmd-<TAG>-linux-musl-x64.zip` |
 | Linux ARM64 (musl)        | `ilspycmd-<TAG>-linux-musl-arm64.zip` |
 | Windows x64| `ilspycmd-<TAG>-win-x64.zip` |
-| 上述全部资产的校验和          | `SHA256SUMS`      |
+| 上述全部资产的校验和        | `SHA256SUMS`      |
+| 当前最新版本信息            | `latest.json` |
 
 `<TAG>` 为上游 ILSpy 的 Release Tag，例如 `v11.1`。
 
@@ -73,8 +75,7 @@ https://github.com/taozhiyu/ILSpy-Binaries/releases/latest/download/latest.json
 
 > **注意：`latest` 的版本选择基于 SemVer 解析，而非发布时间。**
 >
-> GitHub 的 `releases/latest` 指向**发布时间最新**的非草稿、非预发布 Release。
-> 如果先发布 `v11.0`、后发布 `v10.0`，GitHub 会把 `latest` 指向 `v10.0`，
+> 如果先发布 `v11.0`、后发布 `v10.0`，GitHub 可能会把 `latest` 指向 `v10.0`，
 > 这在语义上是错误的。因此本项目的 `latest.json` 中记录的版本由
 > **对全部 Release tag 做 SemVer 比较后取最大者**得出，与发布时间无关。
 > 详细规则见下方 [版本选择规则](#版本选择规则)。
@@ -114,18 +115,6 @@ https://github.com/taozhiyu/ILSpy-Binaries/releases/latest/download/latest.json
   }
 }
 ```
-
-以 `_` 开头的键为注释项，客户端可以安全忽略。
-
-> **破坏性格式变更。** `latest.json` 已精简为上表所示的字段。此前文档中列出的
-> `upstream_version`、`upstream_repository`、`upstream_release_url`、
-> `version_resolution`、`checksum_source`、`checksums` 以及 `assets[].file`
-> 均已**移除**；资产文件名可直接由 `url` 推出。`latest_version` 与每个资产的
-> `rid` / `url` / `sha256` 的语义与位置**未变**。若你的客户端读取过上述被移除的
-> 字段，请改用 `url` 与 `assets[].sha256`。
->
-> 另请注意：`assets` 是**数组**（而非以 RID 为键的对象），且**没有** `size`
-> 字段——若需要文件大小，请使用下载响应的 `Content-Length`。
 
 命令行下载示例：
 
@@ -266,9 +255,6 @@ ILSpy-Binaries
 这样可以保证：即使出现「先发布 v11.0、后发布 v10.0」的情况，
 `latest.json` 仍会正确指向 `v11.0`。
 
-> 该规则与GitHub 内置的 `releases/latest` 语义不同。GitHub 按发布时间选取，
-> 因此在上述场景下会指向 `v10.0`。请一律以 `latest.json` 为准。
-
 ## Self-contained 自包含构建
 
 本项目使用 .NET 的 Self-contained 发布方式。
@@ -284,21 +270,12 @@ dotnet publish \
 
 构建结果会包含运行 ILSpy 所需要的 .NET Runtime。
 
-因此，最终用户通常不需要额外安装：
-
-```text
-.NET SDK
-.NET Runtime
-```
+因此，最终用户通常不需要额外安装：`.NET SDK / Runtime`
 
 使用方式基本就是：
 
 ```text
-下载 ZIP
-   ↓
-解压
-   ↓
-运行 ILSpy
+下载 ZIP ➡️ 解压 ➡️ 运行 ILSpy
 ```
 
 具体仍然需要满足目标操作系统以及相关原生依赖的要求。
@@ -308,15 +285,13 @@ dotnet publish \
 本项目同时提供普通 Linux 和 musl Linux 构建：
 
 ```text
-linux-x64
-linux-arm64
+linux-x64 + linux-arm64
 ```
 
 以及：
 
 ```text
-linux-musl-x64
-linux-musl-arm64
+linux-musl-x64 + linux-musl-arm64
 ```
 
 ILSpy 属于桌面 GUI 应用，并依赖 Avalonia、SkiaSharp 等原生组件，因此：
@@ -369,8 +344,7 @@ Error loading shared library libstdc++.so.6: No such file or directory
 | `LICENSE-GCC-RUNTIME-LIBRARY.txt`   | GCC 运行库许可全文（仅 musl 包） |
 | `GCC-RUNTIME-LIBRARIES.txt`         | 随包 GCC 库版本（仅 musl 包）   |
 
-`LICENSE-GCC-RUNTIME-LIBRARY.txt` 内含 **GPLv3 全文**与 **GCC Runtime Library
-Exception 3.1 全文**，而非仅提供链接。
+`LICENSE-GCC-RUNTIME-LIBRARY.txt` 内含 **GPLv3 全文**与 **GCC Runtime Library Exception 3.1 全文**。
 
 ## 版本规则
 

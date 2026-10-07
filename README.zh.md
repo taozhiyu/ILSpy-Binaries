@@ -61,7 +61,7 @@ English | [简体中文](README.zh.md)
 ### 自动获取最新版本：`latest.json`
 
 每个 Release 都包含一个名为 `latest.json` 的机器可读清单。它记录了**当前最新版本**下
-每个平台的资产绝对下载地址、文件大小与 SHA-256，适合自动化脚本直接消费。
+每个平台的资产绝对下载地址与 SHA-256，适合自动化脚本直接消费。
 
 最新版本的清单可以通过固定地址获取：
 
@@ -83,47 +83,49 @@ https://github.com/taozhiyu/ILSpy-Binaries/releases/latest/download/latest.json
 
 ```json
 {
-  "_comment_version": "本文件由 GitHub Actions 自动生成，请勿手工编辑。",
-  "_comment_latest": "latest 字段指向按 SemVer 解析出的最大版本，而非发布时间最新的版本。",
   "schema_version": 1,
   "repository": "https://github.com/taozhiyu/ILSpy-Binaries",
   "latest_version": "v11.1",
-  "upstream_version": "v11.1",
-  "upstream_repository": "https://github.com/icsharpcode/ILSpy",
-  "upstream_release_url": "https://github.com/icsharpcode/ILSpy/releases/tag/v11.1",
   "generated_at": "2026-10-07T01:23:45Z",
-  "version_resolution": {
-    "_comment": "method=semver 表示 latest_version 由 SemVer 比较得出；不使用发布时间。",
-    "method": "semver",
-    "compared_tags": ["v11.0", "v11.1", "v10.0"],
-    "excluded_drafts": true,
-    "excluded_prereleases": true
-  },
-  "assets": {
-    "linux-x64": {
-      "file": "ilspycmd-v11.1-linux-x64.zip",
-      "url": "https://github.com/taozhiyu/ILSpy-Binaries/releases/download/v11.1/ilspycmd-v11.1-linux-x64.zip",
-      "size": 41234567,
+  "assets": [
+    {
+      "rid": "linux-arm64",
+      "url": "https://github.com/taozhiyu/ILSpy-Binaries/releases/download/v11.1/ilspycmd-v11.1-linux-arm64.zip",
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
-    "linux-arm64": { "...": "..." },
-    "linux-musl-x64": { "...": "..." },
-    "linux-musl-arm64": { "...": "..." },
-    "win-x64": { "...": "..." }
-  },
-  "checksums": {
-    "file": "SHA256SUMS",
-    "url": "https://github.com/taozhiyu/ILSpy-Binaries/releases/download/v11.1/SHA256SUMS"
-  },
+    { "rid": "linux-musl-arm64", "...": "..." },
+    { "rid": "linux-musl-x64", "...": "..." },
+    { "rid": "linux-x64", "...": "..." },
+    { "rid": "win-x64", "...": "..." }
+  ],
   "license": {
     "repository": "MIT",
     "upstream": "MIT",
-    "gcc_runtime_libraries": "GPL-3.0-or-later WITH GCC-exception-3.1"
+    "gcc_runtime_libraries": "GPL-3.0-or-later WITH GCC-exception-3.1",
+    "gcc_runtime_libraries_scope": "linux-musl-* only",
+    "_comment": {
+      "en": "\"repository\" refers to the original files in this repository; \"upstream\" refers to the ILSpy binaries distributed with the packages. Only the linux-musl-* packages additionally bundle the GCC runtime libraries.",
+      "zh-CN": "repository 指本仓库原创文件；upstream 指随包分发的 ILSpy 二进制。仅 linux-musl-* 包额外包含 GCC 运行时库。"
+    }
+  },
+  "_comment": {
+    "en": "This file is generated automatically by GitHub Actions; do not edit manually.\nlatest_version is the version with the greatest SemVer value, not the most recently published one.",
+    "zh-CN": "本文件由 GitHub Actions 自动生成，请勿手工编辑。\nlatest_version 是按 SemVer 数值比较得出的最大版本，不是发布时间最新的版本。"
   }
 }
 ```
 
 以 `_` 开头的键为注释项，客户端可以安全忽略。
+
+> **破坏性格式变更。** `latest.json` 已精简为上表所示的字段。此前文档中列出的
+> `upstream_version`、`upstream_repository`、`upstream_release_url`、
+> `version_resolution`、`checksum_source`、`checksums` 以及 `assets[].file`
+> 均已**移除**；资产文件名可直接由 `url` 推出。`latest_version` 与每个资产的
+> `rid` / `url` / `sha256` 的语义与位置**未变**。若你的客户端读取过上述被移除的
+> 字段，请改用 `url` 与 `assets[].sha256`。
+>
+> 另请注意：`assets` 是**数组**（而非以 RID 为键的对象），且**没有** `size`
+> 字段——若需要文件大小，请使用下载响应的 `Content-Length`。
 
 命令行下载示例：
 

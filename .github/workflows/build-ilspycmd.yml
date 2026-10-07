@@ -445,7 +445,9 @@ jobs:
 
     if: needs.check-version.outputs.should_build == 'true'
 
-    runs-on: ubuntu-24.04
+    # win-x64 -> windows-latest（原生 Windows）；其余 4 个 linux RID -> ubuntu-24.04。
+    # 映射由上面 matrix.include 决定。
+    runs-on: ${{ matrix.os }}
 
     permissions:
 
@@ -457,17 +459,30 @@ jobs:
 
       matrix:
 
-        rid:
+        # 用 include 显式列出 rid-> os 映射，而不是 `rid` x `os` 笛卡尔积：
+        # 后者会展开成 5x5=25 个组合，其中 20 个是无意义的废 job
+        #（例如在 windows runner 上构建 linux-musl-arm64）。
+        #
+        # win-x64 走**原生 Windows runner**：GitHub Actions 本来就提供
+        # windows runner，用 Linux + wine 模拟跑 PE 是自找麻烦——wine 对
+        # .NET self-contained PE 的支持并不完整，且已为此绕过两轮
+        #（先把 wine 改成 wine64，再修 wine64 的安装路径）。
+        include:
 
-          - linux-arm64
+          - rid: linux-x64
+            os: ubuntu-24.04
 
-          - linux-musl-arm64
+          - rid: linux-arm64
+            os: ubuntu-24.04
 
-          - linux-musl-x64
+          - rid: linux-musl-x64
+            os: ubuntu-24.04
 
-          - linux-x64
+          - rid: linux-musl-arm64
+            os: ubuntu-24.04
 
-          - win-x64
+          - rid: win-x64
+            os: windows-latest
 
     # 安全加固 4：统一通过环境变量传递，脚本里一律用 $RELEASE_TAG/$RID，
 
@@ -619,10 +634,55 @@ jobs:
 
       # setup-dotnet 与 dotnet CLI 的严格校验会直接报错。
 
+      # ---------------------------------------------------------------------
+      # Windows 腿工具预检
+      #
+      # 只在 win-x64 这一腿执行。目的不是「装工具」，而是**提前**把缺工具这件事
+      # 变成一条可执行的报错：后面第一个用到 jq 的步骤如果才发现工具缺失，
+      # 报错会离根因很远，排查成本高。
+      #
+      # 为什么单独需要：下面的 global.json 清理步骤用 jq 删掉 .sdk 段，
+      # 而 publish job（仍在 ubuntu 上）也大量依赖 jq，两者不能互相印证。
+      #
+      # 注意 zip 不在这里检查：打包步骤内部已经按 RUNNER_OS 自行选择
+      # zip(linux) / 7z(windows)，并各自给出明确报错。
+      # ---------------------------------------------------------------------
+      - name: Windows 腿工具预检
+
+        if: runner.os == 'Windows'
+
+        shell: bash
+
+        run: |
+
+          set -uo pipefail
+
+          MISSING=""
+
+          if ! command -v jq >/dev/null 2>&1; then
+            MISSING="${MISSING} jq"
+          fi
+
+          if ! command -v dotnet >/dev/null 2>&1; then
+            MISSING="${MISSING} dotnet"
+          fi
+
+          if [ -n "${MISSING}" ]; then
+            echo "::error title=环境不支持::Windows runner 缺少必需工具: ${MISSING}。windows-latest 镜像应自带这些工具；若缺失说明镜像被裁剪，需换runner 镜像。"
+            exit 1
+          fi
+
+          echo "jq: $(command -v jq)"
+          echo "dotnet: $(command -v dotnet)"
+          echo "dotnet --version: $(dotnet --version 2>/dev/null || echo '<读不到>')"
+          echo "工具预检通过"
+
+
       - name: 清理 global.json 里的 SDK 版本锁定
 
         working-directory: ilspy-src
 
+        shell: bash
         run: |
 
           set -euo pipefail
@@ -675,6 +735,7 @@ jobs:
 
         working-directory: ilspy-src
 
+        shell: bash
         run: |
 
           set -euo pipefail
@@ -755,6 +816,7 @@ jobs:
 
         working-directory: ilspy-src
 
+        shell: bash
         run: |
 
           set -uo pipefail
@@ -818,6 +880,7 @@ jobs:
 
         working-directory: ilspy-src
 
+        shell: bash
         run: |
 
           set -euo pipefail
@@ -846,6 +909,7 @@ jobs:
 
       - name: 清理调试符号与无用文件
 
+        shell: bash
         run: |
 
           set -euo pipefail
@@ -920,6 +984,7 @@ jobs:
 
       - name: 随包分发许可与说明文档
 
+        shell: bash
         run: |
 
           set -euo pipefail
@@ -2134,7 +2199,7 @@ jobs:
       #   linux-arm64        qemu-user(aarch64) + Debian arm64 镜像（产物是 glibc 的）
       #   linux-musl-x64     纯净 Alpine 容器
       #   linux-musl-arm64   qemu-user + 纯净 Alpine arm64 容器
-      #   win-x64            wine64（在 Linux runner 上跑 PE）
+      #   win-x64            runner 原生执行（windows-latest，直接跑 ilspycmd.exe）
       #
       # 【失败分类】产物缺陷与环境不支持必须区分开（标题不同、排查方向不同），
       #   但**两者都阻断发布**：宁可 CI 失败，也不发一个没验证过的包。
@@ -2146,6 +2211,7 @@ jobs:
       # =================================================================
       - name: 真机验证（L1 -h / L2 --version / L3 反编译 + 产物内容断言）
 
+        shell: bash
         run: |
 
           # 说明：GitHub 默认 shell 是 `bash -e`，单条命令失败就会中断整个脚本。
@@ -2372,7 +2438,7 @@ jobs:
             linux-arm64)      RUNNER="qemu-glibc" ;;
             linux-musl-x64)   RUNNER="musl" ;;
             linux-musl-arm64) RUNNER="musl-arm64" ;;
-            win-x64)          RUNNER="wine64" ;;
+            win-x64)        RUNNER="windows" ;;
             *)
               echo "::error::未知 RID: ${RID}"
               exit 1
@@ -2388,8 +2454,8 @@ jobs:
             shift 2
             local rc=0
             # 宿主侧兜底超时：容器内路径各自已有 timeout（amd64 用 600、
-            # qemu 路径用 1800），但 native 与 wine64 两路是直接在宿主上
-            # 执行的，其中 wine64 在 Linux 上跑 .NET self-contained PE
+            # qemu 路径用 1800），但 native 与 windows 两路是直接在宿主上
+            # 执行的，其中 windows 那一腿要在 PE 上跑起 .NET self-contained 运行时
             #耗时不可控。缺超时的话一旦挂死会烧到 GitHub 6 小时 job 上限。
             # 2400s 是宽松上限：超过即判定失败，仍由下方分类逻辑归因。
             timeout 2400 "$@" > "${log}" 2>&1 || rc=$?
@@ -2482,48 +2548,47 @@ jobs:
                     '
               fi
               ;;
-            wine64)
-              # win-x64 是 PE 产物，在 Linux runner 上用 wine64 执行。
+            windows)
+              # win-x64 现在跑在**原生 Windows runner** 上（见 matrix.include），
+              # 因此直接执行 ilspycmd.exe，不再需要 wine。
               #
-              # 【为什么必须是 wine64 而不是 wine】
-              # Ubuntu 24.04 上 `apt-get install wine64` 只提供 /usr/bin/wine64；
-              # `wine` 这个包装器来自另一个包。旧代码装 wine64 却调用 wine，
-              # wine 找不到 -> 命令失败 -> 又被当成人为「环境不支持」而静默跳过，
-              # 结果 win-x64 从未真正被验证过。这里统一用 wine64。
+              # 【为什么不再用 wine 模拟】
+              # 之前 win-x64 是在 ubuntu runner 上装 wine 跑 PE，踩了两次：
+              #   1. 装 wine64 却调用 wine（包装器来自另一个包）；
+              #   2. 修成 wine64 后又发现 wine64 包只装 /usr/lib/wine/wine64，
+              #      不提供 /usr/bin/wine64，command -v 必然为空。
+              # 根因是方向本身错了：wine 对 .NET self-contained PE 的支持并不完整
+              #（它只完整支持 .NET Framework，self-contained 的 .NET 运行时
+              #   依赖一堆未在 wine 下验证过的 Win32 API），就算路径修对也未必跑通。
+              # GitHub Actions 本来就提供原生 windows runner，没有理由绕这一圈。
               #
-              # 【为什么不再静默跳过】
-              # 用户要求「每个环境的测试都要有，测试通过再提交 release」。
-              # 跳过等于「win-x64 未验证却照样发布」，与该要求直接冲突，
-              # 故 wine 不可用时判失败（标题为「环境不支持」，与产物缺陷区分）。
-              WINE_BIN=""
-              WINE_ERR=""
-              if ! sudo apt-get update -qq > /tmp/wine-apt.log 2>&1; then
-                WINE_ERR="apt-get update 失败"
-              fi
-              if [ -z "$WINE_ERR" ]; then
-                sudo apt-get install -y -qq wine64 > /tmp/wine-install.log 2>&1 \
-                  || WINE_ERR="wine64 安装失败"
-              fi
-              if [ -z "$WINE_ERR" ]; then
-                WINE_BIN=$(command -v wine64 2>/dev/null || true)
-                [ -n "$WINE_BIN" ] || WINE_ERR="安装后仍找不到 wine64 可执行文件"
-              fi
-              if [ -z "$WINE_ERR" ]; then
-                WINEPREFIX=/tmp/wineprefix WINEARCH=win64 WINEDEBUG=-all \
-                  "$WINE_BIN" --version > /tmp/wine-ver.txt 2>&1 \
-                  || WINE_ERR="wine64 --version 探测失败"
-              fi
-
-              if [ -n "$WINE_ERR" ]; then
-                echo "--- wine 探测日志 ---"
-                sed -n '1,20p' /tmp/wine-install.log 2>/dev/null || true
-                sed -n '1,20p' /tmp/wine-ver.txt 2>/dev/null || true
-                envfail "wine64 不可用（${WINE_ERR}）；win-x64 未取得任何运行证据，按门禁阻断发布"
+              # 【为什么失败仍然阻断发布】
+              # 「环境不支持 -> 阻断发布」的严格策略不变。此处不再有 wine 这个
+              # 天然不可靠的环节，但一旦 L1/L2/L3 任一段失败，依然拒绝打包发布。
+              # Windows 上常见的真实失败模式（缺 DLL、缺 VC++ 运行库、
+              # 架构不是 x64）都会在这里被拦住，而不是流到用户手里。
+              note "执行方式: windows（原生 Windows runner，直接执行 PE，无需 wine）"
+              # Windows 上 .exe 本来就靠扩展名识别，不依赖可执行位；
+              # 这里不 chmod，chmod 在 Git Bash 下对 PE 也没有意义。
+              if [ ! -f "${ABS_ILSPY}" ]; then
+                echo "::error::产物主程序不存在: ${ABS_ILSPY}"
+                FAILED=1
               else
-                note "wine64 探测通过: ${WINE_BIN}（$(WINEPREFIX=/tmp/wineprefix WINEARCH=win64 WINEDEBUG=-all "$WINE_BIN" --version 2>/dev/null | head -1)）"
-                DECOMP_WINE="${SMOKE_DIR}/decompiled-wine"
-                run_and_classify "win-x64 wine64 三级验证" /tmp/verify-wine.log \
-                  env WINEPREFIX=/tmp/wineprefix WINEARCH=win64 WINEDEBUG=-all \
+                # Windows 上 PE 的「架构」等价物是机器类型。这里做一次轻量核对：
+                # 用 PowerShell 读 PE 头里的 Machine 字段，0x8664 = x86-64。
+                # 这一步等价于 linux 侧的 readelf 架构断言，只是 PE 版本的实现。
+                PE_MACHINE=$(powershell -NoProfile -NonInteractive -Command \
+                  "\$b=[System.IO.File]::ReadAllBytes('${ABS_ILSPY//\//\\}'); \$o=[BitConverter]::ToInt32(\$b,0x3C); '0x{0:X4}' -f [BitConverter]::ToUInt16(\$b,\$o+4)" \
+                  2>/dev/null | tr -d '\r\n ' || true)
+                echo "PE Machine = ${PE_MACHINE:-<读取失败>}"
+                case "${PE_MACHINE}" in
+                  0x8664|0x8664|"") ;;
+                  *) fail "PE 架构错配：期望 0x8664 (x86-64)，实际 ${PE_MACHINE}" ;;
+                esac
+                # 路径用 Unix 风格（Git Bash 下是 /d/a/... ），
+                # .NET 侧与 cmd 侧都能解析，无需手工拼 C:\ 路径。
+                DECOMP_WINE="${SMOKE_DIR}/decompiled-win"
+                run_and_classify "win-x64 原生 Windows 三级验证" /tmp/verify-win.log \
                   sh "${SMOKE_DIR}/run_checks.sh" \
                   "${ABS_ILSPY}" "${ABS_OUT}" "${TARGET_DLL}" "${DECOMP_WINE}"
               fi
@@ -2537,6 +2602,7 @@ jobs:
           echo "::notice::RID=${RID} 真机验证全部通过（L1/L2/L3 + 产物内容断言）"
       - name: 打包 zip
 
+        shell: bash
         run: |
 
           set -euo pipefail
@@ -2545,12 +2611,43 @@ jobs:
 
           cd "out/${RID}"
 
-          zip -r -9 -q "../../dist/ilspycmd-${RELEASE_TAG}-${RID}.zip" .
+          # Windows runner 上**没有 zip 命令**（PowerShell 也认不出它），
+          # 但预装了 7-Zip。两边各自用各自有的工具，产物格式与命名保持一致，
+          # 这样 publish 阶段的
+          #   artifacts/ilspycmd-*-<rid>.zip
+          # 核对对两个平台是同一套规则，不会误判「产物缺失」。
+          ZIP_NAME="ilspycmd-${RELEASE_TAG}-${RID}.zip"
+
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            if ! command -v 7z >/dev/null 2>&1; then
+              echo "::error::Windows runner 上找不到 7z，无法打包。windows-latest 镜像预装 7-Zip，若此处失败说明镜像被裁剪过。"
+              exit 1
+            fi
+            # 用 "." 而非目录名，与 Linux 的 zip 分支保持产物结构一致。
+            # 本机 7-Zip 实测三种写法：
+            #   a.zip "."   -> ilspycmd.exe, LICENSE            （与 zip 同构）
+            #   a.zip "./"  -> ilspycmd.exe, LICENSE            （同上，"./" 亦可）
+            #   a.zip "pkg" -> pkg/, pkg/ilspycmd.exe, ...     （多一层，不可用于发布）
+            # 故关键是**不要传 out/${RID} 这个目录名**，其余写法均可。
+            7z a -bso0 -bsp0 "../../dist/${ZIP_NAME}" "." >/dev/null
+            echo "已用 7z 打包: ${ZIP_NAME}"
+          else
+            ZIP_BIN="$(command -v zip || true)"
+            if [ -z "${ZIP_BIN}" ]; then
+              echo "::error::Linux runner 上找不到 zip"
+              exit 1
+            fi
+            zip -r -9 -q "../../dist/${ZIP_NAME}" .
+            echo "已用 zip 打包: ${ZIP_NAME}"
+          fi
 
           cd ../..
 
-          ls -lh dist
+          # 产物名必须与 publish 阶段的门禁约定严格一致，否则会被判成「产物缺失」。
+          test -f "dist/${ZIP_NAME}" \
+            || { echo "::error::压缩包未生成: dist/${ZIP_NAME}"; exit 1; }
 
+          ls -lh dist
       - name: 上传构建产物
 
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -3143,9 +3240,9 @@ jobs:
 
             Please verify downloads against the checksums in `SHA256SUMS`.
 
-            > 说明 / Note：**全部 5 个平台**（linux-x64、linux-arm64、linux-musl-x64、linux-musl-arm64、win-x64）在发布前都通过了三级验证：**L1** `-h`、**L2** `--version`、**L3** 对一个真实 demo 程序集的反编译，**且校验反编译产物内容**（必须生成 `.cs` 并包含预期类型/成员）。Linux 产物另做「解压即用」验证（纯净容器内不设 `LD_LIBRARY_PATH`），arm64 经 `qemu-user` 模拟 aarch64 执行，并对包内**每一个 ELF** 做架构断言（`readelf -h`）；Windows 产物经 `wine64` 实跑。**任一环节失败即中止，不产出 Release。**
+            > 说明 / Note：**全部 5 个平台**（linux-x64、linux-arm64、linux-musl-x64、linux-musl-arm64、win-x64）在发布前都通过了三级验证：**L1** `-h`、**L2** `--version`、**L3** 对一个真实 demo 程序集的反编译，**且校验反编译产物内容**（必须生成 `.cs` 并包含预期类型/成员）。Linux 产物另做「解压即用」验证（纯净容器内不设 `LD_LIBRARY_PATH`），arm64 经 `qemu-user` 模拟 aarch64 执行，并对包内**每一个 ELF** 做架构断言（`readelf -h`）；Windows 产物在**原生 Windows runner** 上直接实跑。**任一环节失败即中止，不产出 Release。**
 
-            > **All five platforms** (linux-x64, linux-arm64, linux-musl-x64, linux-musl-arm64, win-x64) pass a three-stage verification before release: **L1** `-h`, **L2** `--version`, and **L3** an actual decompilation of a real demo assembly whose **output content is asserted** (a `.cs` file must be produced and contain the expected types/members). Linux artifacts additionally verify "runs straight after extraction" inside a clean container (no `LD_LIBRARY_PATH`); arm64 is executed under `qemu-user` aarch64 emulation with an architecture assertion (`readelf -h`) over **every** ELF in the archive; the Windows artifact is executed under `wine64`. **Any failing stage aborts the workflow — no Release is produced.**
+            > **All five platforms** (linux-x64, linux-arm64, linux-musl-x64, linux-musl-arm64, win-x64) pass a three-stage verification before release: **L1** `-h`, **L2** `--version`, and **L3** an actual decompilation of a real demo assembly whose **output content is asserted** (a `.cs` file must be produced and contain the expected types/members). Linux artifacts additionally verify "runs straight after extraction" inside a clean container (no `LD_LIBRARY_PATH`); arm64 is executed under `qemu-user` aarch64 emulation with an architecture assertion (`readelf -h`) over **every** ELF in the archive; the Windows artifact is executed on a **native Windows runner**. **Any failing stage aborts the workflow — no Release is produced.**
 
             > ### 自动更新：`latest.json`
 

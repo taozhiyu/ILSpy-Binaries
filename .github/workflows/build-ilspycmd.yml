@@ -729,7 +729,40 @@ jobs:
 
                                        # 这个开关才能装上
 
-          cache: false                # 本地不引入缓存，避免缓存状态影响还原
+          # ---- NuGet 包缓存（官方内置，见下方说明）----
+          # key   : ilspy-binaries-nuget-<hash>
+          # 作用域 : ~/.nuget/packages，即dotnet restore 的全局包目录
+          # 失效  : 由 cache-dependency-path 指向的文件内容哈希决定；
+          #         上游 csproj / packages.lock.json 变化即自动失效
+          cache: true
+
+          # 依赖清单：上游所有 csproj + lock 文件。
+          # 哈希基于这些文件内容，上游一动就换key，不会拿到过期依赖。
+          cache-dependency-path: |
+            ilspy-src/**/*.csproj
+            ilspy-src/**/packages.lock.json
+
+          # 【为什么开缓存】restore 是本 workflow 最慢的一步，
+          # 且 5 个 RID 每次都要重新解析依赖树并回源。
+          # NuGet 全局包目录跨 job、跨 runner 复用，收益最大且无副作用：
+          # 它只是「包已下载过」的事实记录，不改变依赖解析结果。
+          #
+          # 【为什么锁文件变化会导致失效，这是期望行为】
+          # 本 step 显式传 -p:RestoreLockedMode=false（见Restore 步骤注释：
+          # 上游 csproj 硬编码 RestoreLockedMode=true，而 lock 文件的 RID 段
+          # 固定为 win-x64;win-arm64;linux-x64;osx-arm64，单 RID 传入必然 NU1004）。
+          # 也就是说**锁定校验本来就没在生效**，缓存不会「让 locked 校验被跳过」——
+          # 它从来就没跑过。缓存只影响包的下载与否，不影响版本解析。
+          #
+          # 【为什么不缓存 out/】self-contained 产物与 RID/平台强绑定：
+          # win-x64 的产物在 ubuntu 上无法执行，反之亦然；且 5 条腿并发写同一个
+          # 缓存键会互相覆盖。产物缓存收益低、污染风险高，故只缓存 NuGet 包。
+          #
+          # 【缓存不作用于哪些 job】
+          #   build            : 用（restore 在这里，最耗时）
+          #   check-version    : 不涉及 restore，无需缓存
+          #   publish          : 不跑 restore；它对每个历史 Release 的摘要需求，
+          #                      已由「改用下载 SHA256SUMS」消除（见该步骤注释）
 
       - name: 定位 ilspycmd 项目文件
 
@@ -2777,7 +2810,104 @@ jobs:
 
       # -------------------------------------------------------------------
 
+
+      - name: 发布 GitHub Release
+
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+
+        with:
+
+          tag_name: ${{ needs.check-version.outputs.version }}
+
+          name: "ilspycmd ${{ needs.check-version.outputs.version }} (self-contained)"
+
+          prerelease: ${{ needs.check-version.outputs.prerelease == 'true' }}
+
+          body: |
+
+            ## 简介 / Overview
+
+            自动构建自 [icsharpcode/ILSpy@${{ needs.check-version.outputs.version }}](${{ needs.check-version.outputs.release_url }})（commit `${{ needs.check-version.outputs.commit }}`）的 `ilspycmd` self-contained 版本。压缩包内已包含对应平台的 .NET 运行时，解压即可直接运行，**目标机器无需安装 .NET SDK/Runtime**。已移除调试符号（`*.pdb` / `*.dbg`）、`createdump` 及 API 文档注释（`*.xml`）等对最终用户无用的文件，仅保留运行所需内容。
+
+            Self-contained build of `ilspycmd`, automatically compiled from [icsharpcode/ILSpy@${{ needs.check-version.outputs.version }}](${{ needs.check-version.outputs.release_url }}) at commit `${{ needs.check-version.outputs.commit }}`. Each archive bundles its own .NET runtime — **no .NET SDK/Runtime installation is required** on the target machine. Debug symbols (`*.pdb` / `*.dbg`), the `createdump` crash-dump helper, and API doc-comment `*.xml` files have been stripped, leaving only what's needed to run.
+
+            本 Release 由 GitHub Actions 定时自动生成，非 ILSpy 官方发布。
+
+            This release is generated automatically on a schedule by GitHub Actions and is **not** an official ILSpy release.
+
+            构建记录 / Build run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            ## 下载 / Downloads
+
+            | 平台 / Platform | 文件 / File |
+
+            | --- | --- |
+
+            | Linux x64 (glibc，如 Ubuntu/Debian/CentOS) | `ilspycmd-${{ needs.check-version.outputs.version }}-linux-x64.zip` |
+
+            | Linux arm64 (glibc) | `ilspycmd-${{ needs.check-version.outputs.version }}-linux-arm64.zip` |
+
+            | Linux x64 (musl，如 Alpine) | `ilspycmd-${{ needs.check-version.outputs.version }}-linux-musl-x64.zip` |
+
+            | Linux arm64 (musl) | `ilspycmd-${{ needs.check-version.outputs.version }}-linux-musl-arm64.zip` |
+
+            | Windows x64 | `ilspycmd-${{ needs.check-version.outputs.version }}-win-x64.zip` |
+
+            下载后请用 `SHA256SUMS` 核对文件完整性。
+
+            Please verify downloads against the checksums in `SHA256SUMS`.
+
+            > 说明 / Note：**全部 5 个平台**（linux-x64、linux-arm64、linux-musl-x64、linux-musl-arm64、win-x64）在发布前都通过了三级验证：**L1** `-h`、**L2** `--version`、**L3** 对一个真实 demo 程序集的反编译，**且校验反编译产物内容**（必须生成 `.cs` 并包含预期类型/成员）。Linux 产物另做「解压即用」验证（纯净容器内不设 `LD_LIBRARY_PATH`），arm64 经 `qemu-user` 模拟 aarch64 执行，并对包内**每一个 ELF** 做架构断言（`readelf -h`）；Windows 产物在**原生 Windows runner** 上直接实跑。**任一环节失败即中止，不产出 Release。**
+
+            > **All five platforms** (linux-x64, linux-arm64, linux-musl-x64, linux-musl-arm64, win-x64) pass a three-stage verification before release: **L1** `-h`, **L2** `--version`, and **L3** an actual decompilation of a real demo assembly whose **output content is asserted** (a `.cs` file must be produced and contain the expected types/members). Linux artifacts additionally verify "runs straight after extraction" inside a clean container (no `LD_LIBRARY_PATH`); arm64 is executed under `qemu-user` aarch64 emulation with an architecture assertion (`readelf -h`) over **every** ELF in the archive; the Windows artifact is executed on a **native Windows runner**. **Any failing stage aborts the workflow — no Release is produced.**
+
+            > ### 自动更新：`latest.json`
+
+            > 本 Release 包含 `latest.json`，内含各平台资产的绝对地址与 SHA-256。其中的 `latest_version` 由**全部 Release tag 的 SemVer 数值比较**得出，**不使用发布时间**——因为 GitHub 内置的 `releases/latest` 按发布时间选取，在「先发 v11.0、后发 v10.0」时会错误地指向 v10.0。请一律以 `latest.json` 为准：
+
+            > ```
+
+            > https://github.com/taozhiyu/ILSpy-Binaries/releases/latest/download/latest.json
+
+            > ```
+
+            > 该地址与版本无关，长期有效。以 `_` 开头的键为注释项，客户端可安全忽略。
+
+            > This release ships `latest.json`, which lists the absolute URL and SHA-256 of every asset. `latest_version` is resolved by **SemVer comparison across all release tags**, deliberately NOT by publication time: GitHub's own `releases/latest` ranks by publication time and would wrongly point at `v10.0` if `v11.0` were published first. Always trust `latest.json`. Keys prefixed with `_` are comments and may be ignored.
+
+            > musl 包说明 / musl packages：`ilspycmd` 的 ELF 依赖 `libstdc++.so.6` 与 `libgcc_s.so.1`（self-contained 只打包 .NET 运行时，不含GCC 运行库）。为实现解压即用，`linux-musl-*` 包内已随附这两个库，并为所有相关二进制注入了 `RPATH=$ORIGIN`。它们来自 Alpine 官方仓库的 `libstdc++` / `libgcc` 包，按 **`GPL-3.0-or-later WITH GCC-exception-3.1`** 许可分发（注意：GCC Runtime Library Exception 是叠加在 GPL 之上的附加许可，并非独立许可证）；包内 `LICENSE-GCC-RUNTIME-LIBRARY.txt` 内嵌了 GPLv3 与该例外的**完整正文**。版本清单见 `GCC-RUNTIME-LIBRARIES.txt`。若你的系统已提供这两个库，可安全删除包内副本。
+
+            > The `linux-musl-*` archives ship `libstdc++.so.6` and `libgcc_s.so.1` with `RPATH=$ORIGIN` baked in, so they run immediately after extraction with no extra packages. They come from Alpine's `libstdc++` / `libgcc` packages under **`GPL-3.0-or-later WITH GCC-exception-3.1`** (the GCC Runtime Library Exception is an additional permission layered on top of the GPL, not a standalone license). `LICENSE-GCC-RUNTIME-LIBRARY.txt` embeds the **complete texts** of the GPLv3 and of that exception; see `GCC-RUNTIME-LIBRARIES.txt` for the exact versions. If your system already provides them, deleting the bundled copies is safe.
+
+          files: |
+
+            artifacts/*.zip
+
+            artifacts/SHA256SUMS
+
+      # 把 latest.json 回写到每一个正式版 Release。
+
+      # 这样无论用户从哪个 Release 进入，看到的都是同一份正确清单。
+      # ---------------------------------------------------------------------
+      # 生成 latest.json（按 SemVer 解析最新版本）
       - name: 生成 latest.json（按 SemVer 解析最新版本）
+
+      #
+      # 【步骤顺序：为什么必须在「发布 GitHub Release」之后】
+      # 本步骤靠枚举本仓库**已存在**的 Release 来选出SemVer 最大者。
+      # 若它跑在发布之前，本次构建产出的那个新 Release 根本还没建，
+      # 于是它永远不可能进入候选列表——latest.json 会指向旧的上一版本。
+      #
+      # 实测症状（run 37581742732 一轮）：远端 latest.json 写着
+      #   latest_version = v11.0
+      #   compared_tags  = [v10.0.1, v10.1, v11.0]   <- v11.1 完全不在候选里
+      #   upstream_release_url = .../v11.1            <- 却知道 v11.1 存在，自相矛盾
+      # 原因是生成时刻 08:50:07Z，而 v11.1 的 published_at 是 08:50:13Z，
+      # 晚了 6 秒。这是**系统性问题**，不是偶发：每一轮都会自我错过一个版本。
+      #
+      # 所以顺序必须是：建 Release -> 生成 latest.json -> 回写 latest.json。
+      # 「回写」步骤会重新枚举全部 Release，因此新版本也在内，无需额外处理。
+      # ---------------------------------------------------------------------
 
         id: latest
 
@@ -2805,6 +2935,44 @@ jobs:
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${GH_REPO}/releases?per_page=100")
+
+          # ---- 等待本次构建的 Release 出现在枚举结果里（最终一致性）----
+          #
+          # 【为什么必须等】
+          # 步骤顺序已把本步骤放在「发布 GitHub Release」之后，所以逻辑上
+          # 新 Release 此刻应该已经存在。但 GitHub 的枚举 API 与刚写入的
+          # 资产之间存在最终一致性延迟：短时间内可能还查不到它。
+          #
+          # 若不等待就直接往下走，BEST_TAG 会**静默退回上一个版本**——
+          # 那等于把刚修好的「latest.json 指向旧版本」这个 bug，换一个成因
+          # （API 延迟而非步骤顺序）又 reintroduce 一遍，而且更难发现，
+          # 因为它看起来「正常地跑完了」。
+          #
+          # 所以这里显式轮询等待，最多 5 次（约 30 秒）。超时则**失败**而非降级：
+          # 让构建红掉远好过悄悄发一份指向旧版本的清单。
+          WAIT_TRIES=5
+          WAITED=0
+          while :; do
+            if printf '%s' "$ALL_JSON" \
+               | jq -e --arg t "$CURRENT_TAG" '.[] | select(.tag_name == $t)' >/dev/null; then
+              break
+            fi
+            WAITED=$((WAITED + 1))
+            if [ "$WAITED" -ge "$WAIT_TRIES" ]; then
+              echo "::error title=枚举最终一致性超时::重试 ${WAIT_TRIES} 次（约 30s）后，本次构建的 Release ${CURRENT_TAG} 仍未出现在枚举结果里。"
+              echo "::error::若继续执行，latest_version 会退回上一个版本并悄悄发布，故此处直接失败以避免发出错误清单。"
+              exit 1
+            fi
+            echo "尚未查到 ${CURRENT_TAG}（第 ${WAITED}/${WAIT_TRIES} 次），等待 API 最终一致性..."
+            sleep $((WAITED * 6))
+            ALL_JSON=$(curl -fsS --retry 3 --retry-all-errors \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GH_REPO}/releases?per_page=100")
+          done
+          if [ "$WAITED" -gt 0 ]; then
+            echo "已在第 ${WAITED} 次重试后查到 ${CURRENT_TAG}"
+          fi
 
           # 提取 tag：排除 draft 与 prerelease
 
@@ -2947,27 +3115,31 @@ jobs:
 
           TARGET_URL=$(printf '%s' "$TARGET_JSON" | jq -r '.html_url')
 
-          # 【重要】摘要一律本地重算，不下载历史版本的 SHA256SUMS。
-
-          # 实测教训：SHA256SUMS 是本次新引入的文件，早于它发布的 Release（如
-
-          # v11.1）根本没有这个资产，去下载会得到 404 并让整个 publish 失败。
-
-          # 而 5 个资产 ZIP 必然存在，直接下载重算既无历史包袱也无需额外 API 调用。
-
+          # ---- 摘要来源：直接取该 Release 已有的 SHA256SUMS 资产 ----
+          #
+          # 【为什么不再下载 zip 本地重算】
+          # 旧实现对被选中的版本逐个下载 5 个 zip（每个几十 MB）再 sha256sum，
+          # 纯浪费：SHA256SUMS 本来就是构建时算好并作为 Release 资产上传的
+          # （见「发布 GitHub Release」步骤的 files: artifacts/SHA256SUMS），
+          # 直接下载它只有几百字节。
+          #
+          # 【本次构建这一版尤其要走到「直接取」这条路】
+          # 步骤顺序已调整为「先建 Release、再生成 latest.json」，
+          # 因此 CURRENT_TAG 的 SHA256SUMS 此刻必然已存在于它自己的 Release 里。
+          #
+          # 【兜底】确实存在早于 SHA256SUMS 资产的历史 Release。
+          # 那种情况显式标注 checksum_source 并回退到本地重算，
+          # 而不是让整个 publish 静默失败。
           CACHE_DIR="$(pwd)/.latest-assets/${BEST_TAG}"
 
           mkdir -p "$CACHE_DIR"
 
           SUMS_FILE="$CACHE_DIR/SHA256SUMS"
 
-          : > "$SUMS_FILE"
-
+          # 缺任一 RID 说明该版本资产不全，不能作为 latest（先查，最便宜）
           for rid in ${RID_LIST}; do
 
             name="ilspycmd-${BEST_TAG}-${rid}.zip"
-
-            # 缺任一 RID 说明该版本资产不全，不能作为 latest
 
             if ! printf '%s' "$TARGET_JSON" | jq -e --arg n "$name" \
                  '.assets[]? | select(.name == $n)' >/dev/null; then
@@ -2978,27 +3150,74 @@ jobs:
 
             fi
 
-            echo "下载 ${name} 以重算摘要..."
-
-            if ! curl -fsS --retry 3 --retry-all-errors -L \
-                 -H "Authorization: Bearer ${GH_TOKEN}" \
-                 -H "Accept: application/octet-stream" \
-                 -o "${CACHE_DIR}/${name}" \
-                 "${SERVER_URL}/${GH_REPO}/releases/download/${BEST_TAG}/${name}"; then
-
-              echo "::error::下载 ${name} 失败"
-
-              exit 1
-
-            fi
-
-            ( cd "$CACHE_DIR" && sha256sum "$name" >> "$SUMS_FILE" )
-
           done
 
-          cat "$SUMS_FILE"
+          CHECKSUM_SOURCE="release-asset"
 
-          test -s "$SUMS_FILE" || { echo "::error::SHA256SUMS 为空: $SUMS_FILE"; exit 1; }
+          # 优先走 SHA256SUMS 资产。
+          #
+          # 【为什么必须重试，而不是「一次失败就进兜底」】
+          # 本步骤紧跟在「发布 GitHub Release」之后，资产刚上传完，
+          # 下载端可能因最终一致性延迟而短暂返回 404。若立刻进兜底，
+          # 会因为一次瞬时抖动就走去下载全量 zip 的降级路径——慢，且
+          # latest.json 里的 checksum_source 会显示为降级，徒增噪音。
+          CHECKSUM_SOURCE="release-asset"
+          SUMS_RC=1
+          if printf '%s' "$TARGET_JSON" \
+             | jq -e '.assets[]? | select(.name == "SHA256SUMS")' >/dev/null; then
+            SUMS_TRY=1
+            SUMS_MAX=4
+            while [ "$SUMS_TRY" -le "$SUMS_MAX" ]; do
+              # -f 让 404 表现为失败，而不是把错误页写进目标文件
+              if curl -fsS --retry 3 --retry-all-errors -L \
+                   -H "Authorization: Bearer ${GH_TOKEN}" \
+                   -H "Accept: application/octet-stream" \
+                   -o "$SUMS_FILE" \
+                   "${SERVER_URL}/${GH_REPO}/releases/download/${BEST_TAG}/SHA256SUMS"; then
+                SUMS_RC=0
+                break
+              fi
+              echo "::warning::下载 SHA256SUMS 第 ${SUMS_TRY}/${SUMS_MAX} 次失败（可能是资产刚上传的最终一致性延迟），重试..."
+              sleep $((SUMS_TRY * 5))
+              SUMS_TRY=$((SUMS_TRY + 1))
+            done
+          fi
+          # 该 Release 若确实没有这个资产（早于该文件引入），上面的 if 不会进，
+          # SUMS_RC 保持 1，直接走兜底——这不是延迟，是资产真的不存在。
+
+          if [ "$SUMS_RC" -eq 0 ]; then
+            echo "摘要来源: 该 Release 的 SHA256SUMS 资产（$(wc -c < "$SUMS_FILE" | tr -d ' ') 字节）"
+          else
+            # 会下载全量zip，故明确告警——这是可观测的降级，不是静默行为。
+            CHECKSUM_SOURCE="recomputed-fallback-no-sums-asset"
+
+            echo "::warning title=摘要来源降级::版本 ${BEST_TAG} 没有 SHA256SUMS 资产（早于该文件引入），回退为下载 zip 本地重算。"
+
+            : > "$SUMS_FILE"
+
+            for rid in ${RID_LIST}; do
+
+              name="ilspycmd-${BEST_TAG}-${rid}.zip"
+
+              echo "下载 ${name} 以重算摘要..."
+
+              if ! curl -fsS --retry 3 --retry-all-errors -L \
+                   -H "Authorization: Bearer ${GH_TOKEN}" \
+                   -H "Accept: application/octet-stream" \
+                   -o "${CACHE_DIR}/${name}" \
+                   "${SERVER_URL}/${GH_REPO}/releases/download/${BEST_TAG}/${name}"; then
+
+                echo "::error::下载 ${name} 失败"
+
+                exit 1
+
+              fi
+
+              ( cd "$CACHE_DIR" && sha256sum "$name" >> "$SUMS_FILE" )
+
+            done
+
+          fi
 
           {
 
@@ -3030,6 +3249,7 @@ jobs:
             --arg upstream_tag "$BEST_TAG" \
             --arg compared "$COMPARED" \
             --arg generated "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+            --arg sums_source "$CHECKSUM_SOURCE" \
             --rawfile sums "$SUMS_FILE" \
             '
 
@@ -3123,6 +3343,8 @@ jobs:
 
               ),
 
+              checksum_source: $sums_source,
+
               checksums: {
 
                 file: "SHA256SUMS",
@@ -3194,84 +3416,6 @@ jobs:
 
           } >> "$GITHUB_OUTPUT"
 
-      - name: 发布 GitHub Release
-
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-
-        with:
-
-          tag_name: ${{ needs.check-version.outputs.version }}
-
-          name: "ilspycmd ${{ needs.check-version.outputs.version }} (self-contained)"
-
-          prerelease: ${{ needs.check-version.outputs.prerelease == 'true' }}
-
-          body: |
-
-            ## 简介 / Overview
-
-            自动构建自 [icsharpcode/ILSpy@${{ needs.check-version.outputs.version }}](${{ needs.check-version.outputs.release_url }})（commit `${{ needs.check-version.outputs.commit }}`）的 `ilspycmd` self-contained 版本。压缩包内已包含对应平台的 .NET 运行时，解压即可直接运行，**目标机器无需安装 .NET SDK/Runtime**。已移除调试符号（`*.pdb` / `*.dbg`）、`createdump` 及 API 文档注释（`*.xml`）等对最终用户无用的文件，仅保留运行所需内容。
-
-            Self-contained build of `ilspycmd`, automatically compiled from [icsharpcode/ILSpy@${{ needs.check-version.outputs.version }}](${{ needs.check-version.outputs.release_url }}) at commit `${{ needs.check-version.outputs.commit }}`. Each archive bundles its own .NET runtime — **no .NET SDK/Runtime installation is required** on the target machine. Debug symbols (`*.pdb` / `*.dbg`), the `createdump` crash-dump helper, and API doc-comment `*.xml` files have been stripped, leaving only what's needed to run.
-
-            本 Release 由 GitHub Actions 定时自动生成，非 ILSpy 官方发布。
-
-            This release is generated automatically on a schedule by GitHub Actions and is **not** an official ILSpy release.
-
-            构建记录 / Build run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-            ## 下载 / Downloads
-
-            | 平台 / Platform | 文件 / File |
-
-            | --- | --- |
-
-            | Linux x64 (glibc，如 Ubuntu/Debian/CentOS) | `ilspycmd-${{ needs.check-version.outputs.version }}-linux-x64.zip` |
-
-            | Linux arm64 (glibc) | `ilspycmd-${{ needs.check-version.outputs.version }}-linux-arm64.zip` |
-
-            | Linux x64 (musl，如 Alpine) | `ilspycmd-${{ needs.check-version.outputs.version }}-linux-musl-x64.zip` |
-
-            | Linux arm64 (musl) | `ilspycmd-${{ needs.check-version.outputs.version }}-linux-musl-arm64.zip` |
-
-            | Windows x64 | `ilspycmd-${{ needs.check-version.outputs.version }}-win-x64.zip` |
-
-            下载后请用 `SHA256SUMS` 核对文件完整性。
-
-            Please verify downloads against the checksums in `SHA256SUMS`.
-
-            > 说明 / Note：**全部 5 个平台**（linux-x64、linux-arm64、linux-musl-x64、linux-musl-arm64、win-x64）在发布前都通过了三级验证：**L1** `-h`、**L2** `--version`、**L3** 对一个真实 demo 程序集的反编译，**且校验反编译产物内容**（必须生成 `.cs` 并包含预期类型/成员）。Linux 产物另做「解压即用」验证（纯净容器内不设 `LD_LIBRARY_PATH`），arm64 经 `qemu-user` 模拟 aarch64 执行，并对包内**每一个 ELF** 做架构断言（`readelf -h`）；Windows 产物在**原生 Windows runner** 上直接实跑。**任一环节失败即中止，不产出 Release。**
-
-            > **All five platforms** (linux-x64, linux-arm64, linux-musl-x64, linux-musl-arm64, win-x64) pass a three-stage verification before release: **L1** `-h`, **L2** `--version`, and **L3** an actual decompilation of a real demo assembly whose **output content is asserted** (a `.cs` file must be produced and contain the expected types/members). Linux artifacts additionally verify "runs straight after extraction" inside a clean container (no `LD_LIBRARY_PATH`); arm64 is executed under `qemu-user` aarch64 emulation with an architecture assertion (`readelf -h`) over **every** ELF in the archive; the Windows artifact is executed on a **native Windows runner**. **Any failing stage aborts the workflow — no Release is produced.**
-
-            > ### 自动更新：`latest.json`
-
-            > 本 Release 包含 `latest.json`，内含各平台资产的绝对地址与 SHA-256。其中的 `latest_version` 由**全部 Release tag 的 SemVer 数值比较**得出，**不使用发布时间**——因为 GitHub 内置的 `releases/latest` 按发布时间选取，在「先发 v11.0、后发 v10.0」时会错误地指向 v10.0。请一律以 `latest.json` 为准：
-
-            > ```
-
-            > https://github.com/taozhiyu/ILSpy-Binaries/releases/latest/download/latest.json
-
-            > ```
-
-            > 该地址与版本无关，长期有效。以 `_` 开头的键为注释项，客户端可安全忽略。
-
-            > This release ships `latest.json`, which lists the absolute URL and SHA-256 of every asset. `latest_version` is resolved by **SemVer comparison across all release tags**, deliberately NOT by publication time: GitHub's own `releases/latest` ranks by publication time and would wrongly point at `v10.0` if `v11.0` were published first. Always trust `latest.json`. Keys prefixed with `_` are comments and may be ignored.
-
-            > musl 包说明 / musl packages：`ilspycmd` 的 ELF 依赖 `libstdc++.so.6` 与 `libgcc_s.so.1`（self-contained 只打包 .NET 运行时，不含GCC 运行库）。为实现解压即用，`linux-musl-*` 包内已随附这两个库，并为所有相关二进制注入了 `RPATH=$ORIGIN`。它们来自 Alpine 官方仓库的 `libstdc++` / `libgcc` 包，按 **`GPL-3.0-or-later WITH GCC-exception-3.1`** 许可分发（注意：GCC Runtime Library Exception 是叠加在 GPL 之上的附加许可，并非独立许可证）；包内 `LICENSE-GCC-RUNTIME-LIBRARY.txt` 内嵌了 GPLv3 与该例外的**完整正文**。版本清单见 `GCC-RUNTIME-LIBRARIES.txt`。若你的系统已提供这两个库，可安全删除包内副本。
-
-            > The `linux-musl-*` archives ship `libstdc++.so.6` and `libgcc_s.so.1` with `RPATH=$ORIGIN` baked in, so they run immediately after extraction with no extra packages. They come from Alpine's `libstdc++` / `libgcc` packages under **`GPL-3.0-or-later WITH GCC-exception-3.1`** (the GCC Runtime Library Exception is an additional permission layered on top of the GPL, not a standalone license). `LICENSE-GCC-RUNTIME-LIBRARY.txt` embeds the **complete texts** of the GPLv3 and of that exception; see `GCC-RUNTIME-LIBRARIES.txt` for the exact versions. If your system already provides them, deleting the bundled copies is safe.
-
-          files: |
-
-            artifacts/*.zip
-
-            artifacts/SHA256SUMS
-
-      # 把 latest.json 回写到每一个正式版 Release。
-
-      # 这样无论用户从哪个 Release 进入，看到的都是同一份正确清单。
-
       - name: 回写 latest.json 到全部 Release
 
         env:
@@ -3297,41 +3441,77 @@ jobs:
             | jq -r '.[] | select(.draft==false and .prerelease==false) | .tag_name' \
             | grep -E '^v?[0-9]+\.[0-9]+' | sort -u)
 
+          TOTAL=$(printf '%s\n' "$TAGS" | grep -c . || true)
+
           # 生成阶段产出的 latest.json 已存在；这里只做上传。
 
           # 注意 latest.json 内容里含上游 release_url，为避免逐 Release
 
           # 重新生成造成不一致，统一复用同一份文件。
 
-          OK=0; FAIL=0
+          # ---- 回写一致性：任何一个 Release 没拿到清单都必须让构建失败----
+          #
+          # 【为什么不能「部分失败也算过」】
+          # latest.json 是对外契约，消费方通过
+          #   releases/latest/download/latest.json
+          # 取清单。若只有部分 Release 拿到新清单，就会出现**清单不一致**：
+          #   - 新 Release 里是正确清单（指向 v11.1）
+          #   - 旧 Release 里仍是旧清单（声称最新是 v11.0）
+          # 用户从哪个入口进来拿到的东西不一样，这比「全都没写」更糟，
+          # 因为它看起来是成功的。
+          #
+          # 所以：全部成功才算成功。任一失败 -> 打印对照表 -> 非零退出。
+          # 对照表让人一眼看出该补哪个 Release，不必靠猜。
+          LANDED=""
+          MISSING=""
+          OK=0
+          FAIL=0
 
           while IFS= read -r t; do
 
             [ -n "$t" ] || continue
 
-            if gh release upload "$t" latest.json \
-                 --repo "$GH_REPO" --clobber >/dev/null 2>&1; then
+            # 单个 Release 也重试 3 次：网络抖动 / API 限流不该让整轮发布失败。
+            UPLOAD_OK=0
+            UPLOAD_TRY=1
+            UPLOAD_MAX=3
+            while [ "$UPLOAD_TRY" -le "$UPLOAD_MAX" ]; do
+              if gh release upload "$t" latest.json \
+                   --repo "$GH_REPO" --clobber >/dev/null 2>&1; then
+                UPLOAD_OK=1
+                break
+              fi
+              sleep $((UPLOAD_TRY * 5))
+              UPLOAD_TRY=$((UPLOAD_TRY + 1))
+            done
 
-              echo "已上传 latest.json -> $t"
-
+            if [ "$UPLOAD_OK" -eq 1 ]; then
+              echo "  [已落] $t"
+              LANDED="${LANDED} ${t}"
               OK=$((OK + 1))
-
             else
-
-              echo "::warning::上传 latest.json 到 $t 失败"
-
+              echo "  [未落] $t （已重试 ${UPLOAD_MAX} 次）"
+              MISSING="${MISSING} ${t}"
               FAIL=$((FAIL + 1))
-
             fi
 
           done <<< "$TAGS"
 
-          echo "latest.json 回写完成：成功 ${OK}，失败 ${FAIL}"
+          echo
+          echo "::group::latest.json 落点对照表"
+          echo "候选总数: ${TOTAL}"
+          echo "已落(${OK})  :${LANDED:-（无）}"
+          echo "未落 (${FAIL}) :${MISSING:-（无）}"
+          echo "::endgroup::"
 
-          if [ "$OK" -eq 0 ]; then
-
-            echo "::error::没有任何 Release 成功接收 latest.json"
-
+          if [ "$FAIL" -ne 0 ]; then
+            echo "::error title=latest.json 回写不完整::${FAIL}/${TOTAL} 个 Release 未拿到本次清单：${MISSING}"
+            echo "::error::这会造成对外清单不一致：部分 Release 声称的 latest_version 仍是旧版本。"
+            echo "::error::补救方式：对上面「未落」列出的每个 tag 手动执行——"
+            echo "::error::   gh release upload <tag> latest.json --repo ${GH_REPO} --clobber"
+            echo "::error::latest.json 已由上一阶段生成完毕、内容正确，无需重新生成。"
             exit 1
-
           fi
+
+          echo "latest.json 已回写到全部 ${OK} 个 Release"
+          echo "::notice::latest.json 回写完整（${OK}/${TOTAL}），清单一致性成立"

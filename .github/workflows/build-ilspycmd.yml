@@ -1439,15 +1439,17 @@ jobs:
 
           requiring `apk add libstdc++ libgcc` on the target machine.
 
+          Source packages (Alpine Linux):
+            libstdc++-<version> <arch> {gcc}
+            libgcc-<version>   <arch> {gcc}
+
           The files are taken UNMODIFIED from the official Alpine Linux
-
           repositories (the libstdc++ and libgcc packages of the gcc source
-
-          package), fetched from a container matching the target RID. The exact
-
-          package versions and architectures shipped in this archive are listed
-
-          in GCC-RUNTIME-LIBRARIES.txt next to this file.
+          package), fetched from a container matching the target RID so the
+          architecture always matches the artifact. The <arch> placeholders
+          above are replaced with the actual architecture during packaging.
+          The exact versions shipped in this archive are listed in
+          GCC-RUNTIME-LIBRARIES.txt next to this file.
 
           ------------------------------------------------------------------------
 
@@ -2300,10 +2302,20 @@ jobs:
               ;;
             wine)
               # win-x64 是 PE 产物，Linux runner 上用 wine 执行
-              if ! command -v wine >/dev/null 2>&1; then
-                echo "::notice title=环境不支持::wine 未安装，跳过 win-x64 实跑。"
-                echo "::notice::产物已通过架构校验（PE Machine=x86-64），"
-                echo "::notice::但未在 Windows 实机运行过。"
+              # win-x64 是 PE 产物。GitHub 的 ubuntu runner 默认**没有 wine**
+              # （`command -v wine` 可能命中一个残缺包装器，实际跑不起来），
+              # 故此处显式安装并做真实探测；探测不过则标记为「未验证」
+              # 而非让整次构建失败。PE 架构已由前面的 PE Machine 校验把关。
+              WINE_OK=0
+              if sudo apt-get update -qq && sudo apt-get install -y -qq wine64 \
+                   >/dev/null 2>&1 && command -v wine64 >/dev/null 2>&1; then
+                if WINEPREFIX=/tmp/wine WINEARCH=win64 wine64 --version >/dev/null 2>&1; then
+                  WINE_OK=1
+                fi
+              fi
+              if [ "$WINE_OK" != "1" ]; then
+                echo "::warning title=环境不支持::wine 不可用，win-x64 未做实跑验证。"
+                echo "::warning::产物已通过 PE Machine 校验（x86-64），但未在 Windows 实机运行过。"
                 SKIP_EXEC=1
               fi
               chmod +x "${OUT_DIR}/ilspycmd.exe" 2>/dev/null || true
@@ -2325,6 +2337,13 @@ jobs:
           if [ "$FAILED" -ne 0 ]; then
             echo "::error::RID=${RID} 真机验证未全部通过，拒绝发布"
             exit 1
+          fi
+          if [ -n "${SKIP_EXEC}" ]; then
+            # 环境不具备该架构的执行能力时，明确标注「未验证」而不是假装通过。
+            # 产物仍受架构断言保护（ELF/PE Machine + 依赖完整性），
+            # 但「能否运行」这一项在本次构建中没有取得证据。
+            echo "::warning title=部分未验证::RID=${RID} 架构断言已通过，但因环境限制未做实跑验证"
+            exit 0
           fi
           echo "::notice::RID=${RID} 真机验证全部通过（L1/L2/L3）"
       - name: 打包 zip

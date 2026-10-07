@@ -1,65 +1,156 @@
 # ILSpy Binaries
 
-Unofficial automated self-contained builds of [ILSpy](https://github.com/icsharpcode/ILSpy).
+Unofficial automated, self-contained builds of [ILSpy](https://github.com/icsharpcode/ILSpy).
 
 [![Latest Release](https://img.shields.io/github/v/release/taozhiyu/ILSpy-Binaries?display_name=tag&sort=semver)](https://github.com/taozhiyu/ILSpy-Binaries/releases/latest)
 [![Build Status](https://img.shields.io/github/actions/workflow/status/taozhiyu/ILSpy-Binaries/build-ilspycmd.yml?branch=main&label=build)](https://github.com/taozhiyu/ILSpy-Binaries/actions/workflows/build-ilspycmd.yml)
 [![License](https://img.shields.io/github/license/taozhiyu/ILSpy-Binaries?label=license)](https://github.com/taozhiyu/ILSpy-Binaries/blob/main/LICENSE)
 
-[简体中文](README.zh.md) | English
+English | [简体中文](README.zh.md)
 
-This repository automatically tracks new stable releases from the upstream ILSpy project, builds ILSpy for multiple target platforms, packages each build as a standalone ZIP archive, and publishes the resulting binaries as GitHub Releases.
+This repository automatically tracks new stable releases of the upstream ILSpy project, builds `ilspycmd` for multiple platforms and architectures in GitHub Actions, packages each build as an independent ZIP archive, and publishes the result as a GitHub Release.
 
-The generated packages are intended to run without requiring users to install the .NET SDK or .NET Runtime separately.
+The published archives are built as **self-contained**, so the target machine does not need the .NET SDK or the .NET Runtime installed separately.
 
-> **Disclaimer:** This is an unofficial third-party project and is not affiliated with, maintained by, or endorsed by the ILSpy project or its maintainers.
+> **Disclaimer:** This is an unofficial third-party project. It is not affiliated with, maintained by, or endorsed by the ILSpy project or its maintainers.
 
 ## Features
 
-* Automatically checks the upstream ILSpy repository for new stable releases
-* Automatically builds newly released versions
-* Self-contained publishing with the .NET runtime included
-* No .NET SDK installation required on the target machine
-* Multiple platform and architecture targets
-* Automatic ZIP packaging
-* Automatic GitHub Release creation
-* Stable download URLs through `releases/latest`
+* Automatically detects new stable releases of upstream ILSpy
+* Automatically builds a new version once upstream publishes a stable release
+* Self-contained publishing, with the .NET runtime bundled
+* Target machines need neither the .NET SDK nor the .NET Runtime
+* Supports Linux x64, Linux ARM64, Windows x64, and additionally provides Linux musl builds
+* Automatically produces ZIP archives and creates a GitHub Release
+* Every release ships a machine-readable `latest.json` manifest with absolute download URLs and SHA-256 per platform
+* No long-lived ILSpy source fork has to be maintained
 
-## Supported Builds
+## Supported Platforms
 
-Each upstream ILSpy release is built into the following packages:
+Each upstream ILSpy release is built into the following targets by default:
 
-| Target             | Package                |
-| ------------------ | ---------------------- |
-| Linux ARM64        | `linux-arm64.zip`      |
-| Linux ARM64 (musl) | `linux-musl-arm64.zip` |
-| Linux x64 (musl)   | `linux-musl-x64.zip`   |
-| Linux x64          | `linux-x64.zip`        |
-| Windows x64        | `win-x64.zip`          |
+| Platform | Architecture / Runtime| RID                |
+| -------- | --------------------- | ------------------- |
+| Linux    | ARM64                 | `linux-arm64`       |
+| Linux    | ARM64 / musl          | `linux-musl-arm64`  |
+| Linux    | x64 / musl            | `linux-musl-x64`    |
+| Linux    | x64                   | `linux-x64`         |
+| Windows  | x64                   | `win-x64`           |
 
-The exact availability of a target depends on the upstream ILSpy source and its native dependencies.
+> The table above lists the RID (Runtime Identifier). The actual published asset names also embed the upstream tag, e.g. `ilspycmd-v11.1-linux-x64.zip`. See [Downloads](#downloads) for details.
 
-In particular, the `linux-musl-*` builds use the .NET musl runtime identifiers and require the native dependencies used by ILSpy/Avalonia to be compatible with the target environment.
+Whether a given target can be built and run successfully depends on the source of the corresponding ILSpy version and on its native dependencies.
 
 ## Downloads
 
-Open the [Releases](https://github.com/taozhiyu/ILSpy-Binaries/releases) page to download a specific version.
+Go to the [Releases](https://github.com/taozhiyu/ILSpy-Binaries/releases) page to download a specific version.
 
-For the latest release, stable asset URLs are also available:
+Each release contains the following assets:
+
+| Platform / Runtime              | Asset name template                      |
+| ------------------------------- | ---------------------------------------- |
+| Linux x64 (glibc)               | `ilspycmd-<TAG>-linux-x64.zip`           |
+| Linux ARM64 (glibc)             | `ilspycmd-<TAG>-linux-arm64.zip`         |
+| Linux x64 (musl, e.g. Alpine)   | `ilspycmd-<TAG>-linux-musl-x64.zip`      |
+| Linux ARM64 (musl)              | `ilspycmd-<TAG>-linux-musl-arm64.zip`    |
+| Windows x64| `ilspycmd-<TAG>-win-x64.zip`             |
+| Checksums for all of the above  | `SHA256SUMS`                             |
+
+`<TAG>` is the upstream ILSpy release tag, for example `v11.1`.
+
+### Automated updates via `latest.json`
+
+Every release includes a machine-readable manifest named `latest.json`. It records the **current latest version** together with the absolute download URL, file size, and SHA-256 of each platform asset, and is suitable for direct consumption by automation scripts.
+
+The manifest for the latest version is available at a fixed, version-independent URL:
 
 ```text
-https://github.com/<OWNER>/ILSpy-Binaries/releases/latest/download/win-x64.zip
-https://github.com/<OWNER>/ILSpy-Binaries/releases/latest/download/linux-x64.zip
-https://github.com/<OWNER>/ILSpy-Binaries/releases/latest/download/linux-arm64.zip
-https://github.com/<OWNER>/ILSpy-Binaries/releases/latest/download/linux-musl-x64.zip
-https://github.com/<OWNER>/ILSpy-Binaries/releases/latest/download/linux-musl-arm64.zip
+https://github.com/taozhiyu/ILSpy-Binaries/releases/latest/download/latest.json
 ```
 
-Replace `<OWNER>` with the GitHub account or organization that owns this repository.
+This URL does not change between releases, so it is safe to hard-code.
 
-## How It Works
+> **Note: the version in `latest` is resolved by SemVer, not by publication time.**
+>
+> GitHub's own `releases/latest` points to the most recently *published*
+> non-draft, non-prerelease release. If `v11.0` is published first and `v10.0`
+> second, GitHub will point `latest` at `v10.0`, which is semantically wrong.
+> Therefore the `latest_version` recorded in this project's `latest.json` is
+> determined by **SemVer comparison across all release tags**, and is independent
+> of publication time. See [Version Selection Rules](#version-selection-rules).
 
-The workflow is designed to avoid maintaining a fork of ILSpy.
+Structure of `latest.json`:
+
+```json
+{
+  "_comment_version": "Auto-generated by GitHub Actions. Do not edit manually.",
+  "_comment_latest": "latest_version is the greatest tag by SemVer, NOT the most recently published one.",
+  "schema_version": 1,
+  "repository": "https://github.com/taozhiyu/ILSpy-Binaries",
+  "latest_version": "v11.1",
+  "upstream_version": "v11.1",
+  "upstream_repository": "https://github.com/icsharpcode/ILSpy",
+  "upstream_release_url": "https://github.com/icsharpcode/ILSpy/releases/tag/v11.1",
+  "generated_at": "2026-10-07T01:23:45Z",
+  "version_resolution": {
+    "_comment": "method=semver means latest_version is chosen by SemVer comparison; publication time is not used.",
+    "method": "semver",
+    "compared_tags": ["v11.0", "v11.1", "v10.0"],
+    "excluded_drafts": true,
+    "excluded_prereleases": true
+  },
+  "assets": {
+    "linux-x64": {
+      "file": "ilspycmd-v11.1-linux-x64.zip",
+      "url": "https://github.com/taozhiyu/ILSpy-Binaries/releases/download/v11.1/ilspycmd-v11.1-linux-x64.zip",
+      "size": 41234567,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "linux-arm64": { "...": "..." },
+    "linux-musl-x64": { "...": "..." },
+    "linux-musl-arm64": { "...": "..." },
+    "win-x64": { "...": "..." }
+  },
+  "checksums": {
+    "file": "SHA256SUMS",
+    "url": "https://github.com/taozhiyu/ILSpy-Binaries/releases/download/v11.1/SHA256SUMS"
+  },
+  "license": {
+    "repository": "MIT",
+    "upstream": "MIT",
+    "gcc_runtime_libraries": "GPL-3.0-or-later WITH GCC-exception-3.1"
+  }
+}
+```
+
+Keys beginning with an underscore are comment fields and may be safely ignored by clients.
+
+Command-line example:
+
+```bash
+# 1) Read the manifest and extract the latest version
+LATEST_TAG=$(curl -fsSL https://github.com/taozhiyu/ILSpy-Binaries/releases/latest/download/latest.json \
+  | grep -o '"latest_version": *"[^"]*"' | cut -d '"' -f 4)
+
+# 2) Download by the absolute URL from the manifest and verify SHA-256
+URL="https://github.com/taozhiyu/ILSpy-Binaries/releases/download/${LATEST_TAG}/ilspycmd-${LATEST_TAG}-linux-x64.zip"
+curl -fLO "$URL"
+curl -fsSL "https://github.com/taozhiyu/ILSpy-Binaries/releases/download/${LATEST_TAG}/SHA256SUMS" \
+  | grep "linux-x64.zip$" | sha256sum -c -
+```
+
+### About `releases/latest/download/<file>`
+
+GitHub provides no aliasing for asset names, and this project's asset names embed
+the upstream tag. Consequently, a URL shaped like
+`releases/latest/download/linux-x64.zip` **cannot be resolved** and returns 404.
+Use the `latest.json` mechanism above; it is the genuinely stable entry point.
+
+## Automation Workflow
+
+This project neither forks ILSpy nor keeps a permanent copy of the ILSpy source code in this repository.
+
+The overall flow is as follows:
 
 ```mermaid
 flowchart TD
@@ -81,31 +172,35 @@ flowchart TD
     I --> J["Generate ZIP"]
     J --> K["GitHub Release"]
 
-    K --> L["linux-arm64.zip"]
-    K --> M["linux-musl-arm64.zip"]
-    K --> N["linux-musl-x64.zip"]
-    K --> O["linux-x64.zip"]
-    K --> P["win-x64.zip"]
+    K --> L["ilspycmd-VERSION-linux-arm64.zip"]
+    K --> M["ilspycmd-VERSION-linux-musl-arm64.zip"]
+    K --> N["ilspycmd-VERSION-linux-musl-x64.zip"]
+    K --> O["ilspycmd-VERSION-linux-x64.zip"]
+    K --> P["ilspycmd-VERSION-win-x64.zip"]
+    K --> Q["latest.json<br/>(SemVer-resolved)"]
+    K --> R["SHA256SUMS"]
 ```
 
-The build environment is provided by GitHub Actions. The .NET SDK is only required during the CI build process and is not bundled as a prerequisite for end users.
+GitHub Actions provides the build environment.
+
+Therefore:
+
+> **The .NET SDK exists only inside the GitHub Actions build environment. It is not a prerequisite for end users.**
 
 ## Release Synchronization
 
-The workflow periodically checks:
+GitHub Actions periodically checks:
 
 ```text
 https://github.com/icsharpcode/ILSpy/releases
 ```
 
-When a new stable upstream release is detected, the workflow:
-
+When a new stable version is detected, the following steps run automatically:
 
 ```mermaid
 flowchart TD
     A["Upstream ILSpy releases a new version"] --> B["GitHub Actions scheduled check"]
     B --> C{"Does the corresponding Release already exist?"}
-
     C -->|Yes| D["Skip build"]
     C -->|No| E["Fetch the corresponding Release Tag"]
 
@@ -127,18 +222,57 @@ flowchart TD
 
     N --> O["Upload build artifacts"]
     O --> P["Create GitHub Release"]
+    P --> Q["Enumerate all releases<br/>pick max by SemVer"]
+    Q --> R["Generate latest.json<br/>with SHA-256"]
+    R --> S["Write back to every release"]
 ```
 
+For example, when upstream publishes:
 
-If the corresponding release already exists, the workflow does not rebuild it automatically.
+```text
+icsharpcode/ILSpy
+└── v11.2
+```
 
-A manual workflow dispatch can also be used to build a specific upstream tag.
+this repository automatically produces:
+
+```text
+ILSpy-Binaries
+└── v11.2
+    ├── ilspycmd-v11.2-linux-arm64.zip
+    ├── ilspycmd-v11.2-linux-musl-arm64.zip
+    ├── ilspycmd-v11.2-linux-musl-x64.zip
+    ├── ilspycmd-v11.2-linux-x64.zip
+    ├── ilspycmd-v11.2-win-x64.zip
+    ├── latest.json
+    └── SHA256SUMS
+```
+
+If the corresponding release already exists with a complete set of assets, it is not rebuilt. If the release exists but some assets are missing, the build runs again to complete the set.
+
+A specific upstream tag can also be built manually via the GitHub Actions "Run workflow" function.
+
+### Version Selection Rules
+
+The `latest_version` recorded in `latest.json` is determined as follows:
+
+1. Enumerate **all** releases of this repository, across every version. Exclude drafts and prereleases.
+2. Parse each tag as SemVer, strip the leading `v`, and compare `major.minor.patch` segment by segment as integers.
+3. The greatest value becomes `latest_version`. On a tie, fall back to comparing the raw tag strings.
+4. **Publication time is not a ranking criterion.**
+
+This guarantees that even if `v11.0` is published before `v10.0`, `latest.json`
+still correctly points at `v11.0`.
+
+> This rule differs from GitHub's built-in `releases/latest` semantics, which ranks
+> by publication time and would therefore point at `v10.0` in the scenario above.
+> Always rely on `latest.json` instead.
 
 ## Self-Contained Builds
 
-The builds use .NET self-contained publishing.
+This project uses .NET self-contained publishing.
 
-Conceptually, the build process is equivalent to:
+The core build logic is equivalent to:
 
 ```bash
 dotnet publish \
@@ -147,34 +281,50 @@ dotnet publish \
   --runtime <RID>
 ```
 
-This means the generated package includes the .NET runtime required by ILSpy.
+The build output therefore contains the .NET runtime required to run ILSpy.
 
-End users therefore do **not** need to install:
+End users generally do not need to install any of the following:
 
-* .NET SDK
-* .NET Runtime
-* ASP.NET Core Runtime
+```text
+.NET SDK
+.NET Runtime
+```
 
-The package can be extracted and launched directly, subject to the requirements of the target operating system and native dependencies.
+Usage is essentially:
 
-## Linux musl Builds
+```text
+Download the ZIP
+   ↓
+Extract
+   ↓
+Run ilspycmd
+```
 
-The `linux-musl-x64` and `linux-musl-arm64` packages are intended for Linux distributions using musl libc, such as Alpine Linux.
+The target operating system and its native dependency requirements still have to be satisfied.
 
-These builds are separate from the regular glibc-based Linux packages:
+## Linux and Linux musl
+
+This repository provides both regular Linux and musl Linux builds:
 
 ```text
 linux-x64
 linux-arm64
 ```
 
-and should not be treated as interchangeable.
+as well as:
 
-Because ILSpy is a desktop application and uses native components through dependencies such as Avalonia and SkiaSharp, successful .NET publishing alone does not guarantee compatibility with every musl-based environment.
+```text
+linux-musl-x64
+linux-musl-arm64
+```
 
-For this reason, musl builds should be validated on an actual musl-based system before being considered universally compatible.
+ILSpy is a desktop GUI application and relies on native components such as Avalonia and SkiaSharp. Therefore:
 
-### Bundled GCC Runtime Libraries
+> A successful .NET musl publish does not automatically imply that all native ILSpy dependencies work in every musl-based Linux environment.
+
+For this reason, extra checks are performed on the musl build artifacts. Actual use should still be validated on the target musl-based distribution.
+
+### GCC Runtime Libraries Bundled with the Packages
 
 The `ilspycmd` executable declares the following dynamic dependencies:
 
@@ -183,62 +333,47 @@ NEEDED  libstdc++.so.6
 NEEDED  libgcc_s.so.1
 ```
 
-A self-contained .NET publish bundles the .NET runtime but **not** the GCC runtime libraries, and a minimal Alpine installation does not provide them either. Running the binary on such a system would fail with:
+A .NET self-contained publish bundles the .NET runtime but **not** the GCC runtime libraries, and a minimal Alpine installation does not provide them either. Running the binary on such a system fails with:
 
 ```text
 Error loading shared library libstdc++.so.6: No such file or directory
 ```
 
-To make the archives usable immediately after extraction, every `linux-musl-*` archive therefore ships these two libraries alongside the executable, and all relevant ELF binaries are patched with `RPATH=$ORIGIN` so the loader resolves them from the package directory.
+To make the archives usable immediately after extraction, every `linux-musl-*` archive ships these two libraries alongside the executable, and `RPATH=$ORIGIN` is injected into all relevant ELF binaries so the loader resolves them from the package directory.
 
-| File                     | Size    | Purpose                            |
-| ------------------------ | ------- | ---------------------------------- |
-| `libstdc++.so.6`         | ~2.7 MB | C++ standard library               |
-| `libgcc_s.so.1`          | ~170 KB | GCC low-level runtime              |
+| File            | Size    | Purpose                       |
+| --------------- | ------- | ----------------------------- |
+| `libstdc++.so.6` | ~2.7 MB | C++ standard library          |
+| `libgcc_s.so.1` | ~170 KB | GCC low-level runtime         |
 
-Both files come from Alpine Linux's `libstdc++` and `libgcc` packages and are redistributed under the [GCC Runtime Library Exception](https://www.gnu.org/licenses/gcc-exception-3.1.html). See `LICENSE-GCC-RUNTIME-LIBRARY.txt` inside the archive for details, and `GCC-RUNTIME-LIBRARIES.txt` for the exact package versions.
+Both files come from the Alpine Linux `libstdc++` and `libgcc` packages.
 
-If your system already provides these libraries, the bundled copies are not used and can be safely deleted.
+> Licensing details, including the exact applicable license expressions and the redistribution conditions, are described in the "Bundled GCC Runtime Libraries" section of [License](#license).
 
-> Note: without the bundled libraries or an `RPATH` patch, copying them into the package directory alone would not work — the musl loader searches `/etc/ld-musl-*.path` and the default library directories, **not** the directory containing the executable.
+If your system already provides these two libraries, the copies inside the package are not used and can be safely deleted.
 
 ## Archive Contents
 
 Each published ZIP archive contains:
 
-| File / Directory         | Description                                                        |
-| ------------------------ | ------------------------------------------------------------------ |
-| `ilspycmd`               | The executable (self-contained, no .NET installation required)      |
-| `*.dll`, `*.so`          | Application assemblies and the bundled .NET runtime                 |
-| `LICENSE`                | Upstream ILSpy license (MIT)                                        |
-| `README.md`              | This document (English)                                             |
-| `README.zh.md`           | This document (Chinese)                                             |
-| `README-UPSTREAM.md`     | Upstream `ilspycmd` documentation                                   |
-| `BUILD-INFO.txt`         | Exact upstream tag, commit, build date and SDK used                 |
-| `LICENSE-GCC-RUNTIME-LIBRARY.txt` | GCC runtime library licensing (musl packages only)        |
-| `GCC-RUNTIME-LIBRARIES.txt`         | Bundled GCC library versions (musl packages only)     |
+| File / Directory                  | Description                                                |
+| --------------------------------- | ---------------------------------------------------------- |
+| `ilspycmd`                        | The executable (self-contained, no .NET installation needed) |
+| `*.dll`, `*.so`                   | Application assemblies and the bundled .NET runtime         |
+| `LICENSE`                         | Upstream ILSpy license (MIT)                                |
+| `README.md`                       | This document (English)                                     |
+| `README.zh.md`                    | This document (Chinese)                                     |
+| `README-UPSTREAM.md`              | Upstream `ilspycmd` documentation                           |
+| `BUILD-INFO.txt`                  | Upstream tag, commit, build date, and SDK used              |
+| `LICENSE-GCC-RUNTIME-LIBRARY.txt` | GCC runtime library licensing, full texts (musl packages only)   |
+| `GCC-RUNTIME-LIBRARIES.txt`       | Bundled GCC library versions (musl packages only)           |
 
-## Repository Structure
-
-The repository itself does not need to contain a copy of the ILSpy source code.
-
-A minimal setup can look like:
-
-```text
-ILSpy-Binaries/
-├── .github/
-│   └── workflows/
-│       └── ilspy-release.yml
-└── README.md
-```
-
-The source code is fetched from the upstream repository during GitHub Actions execution.
-
-This keeps the repository lightweight and avoids maintaining a permanent fork solely for binary distribution.
+`LICENSE-GCC-RUNTIME-LIBRARY.txt` contains the **full text** of the GPLv3 and of
+the GCC Runtime Library Exception 3.1, rather than links only.
 
 ## Versioning
 
-Release tags follow the upstream ILSpy release tags.
+Release tags of this repository follow the upstream ILSpy release tags.
 
 For example:
 
@@ -252,45 +387,126 @@ ILSpy-Binaries
 └── v11.1
 ```
 
-The source version is therefore traceable directly to the upstream ILSpy release.
+Every release of this repository can therefore be traced directly back to the corresponding upstream ILSpy release.
 
-## Source
+## Upstream Project
 
-Upstream project:
+Official ILSpy repository:
 
-* Repository: https://github.com/icsharpcode/ILSpy
-* Releases: https://github.com/icsharpcode/ILSpy/releases
+https://github.com/icsharpcode/ILSpy
 
-This repository builds from the upstream ILSpy source and does not modify the ILSpy source code unless explicitly stated in a particular workflow or release.
+Official releases:
+
+https://github.com/icsharpcode/ILSpy/releases
+
+This repository builds binaries from the upstream ILSpy source and does not modify the ILSpy source code by default.
+
+## Relationship with Official ILSpy
+
+This project:
+
+* **is not official ILSpy**
+* **is not the official ILSpy distribution repository**
+* **is not maintained by the ILSpy project**
+* **does not represent the ILSpy project or its maintainers**
+
+The sole purpose of this project is to provide automated, multi-platform, self-contained binary builds.
+
+For ILSpy source code, development, issues, official releases, and project documentation, visit:
+
+https://github.com/icsharpcode/ILSpy
 
 ## License
 
-The binaries distributed here are built from the ILSpy project.
+### Original Content of This Repository
 
-Please refer to the upstream ILSpy repository for the applicable source code licenses, third-party licenses, notices, and attribution requirements:
+The GitHub Actions workflows, scripts, and other original files of this repository are licensed under the **MIT License**.
+
+The full license text is in the [LICENSE](LICENSE) file at the root of this repository.
+
+### Upstream ILSpy
+
+The binaries published here are built from the ILSpy project.
+
+The upstream ILSpy project is distributed under the MIT License. Its source license, third-party component licenses, copyright statements, and related notices are those of the upstream project:
 
 https://github.com/icsharpcode/ILSpy
 
-This repository's GitHub Actions workflow and other original repository-specific files are provided under the license specified by this repository, unless otherwise stated.
+Third-party components bundled into `ilspycmd` (including Avalonia, NuGet.Protocol, and the .NET runtime itself) are licensed separately by their respective authors. Refer to the upstream project for the authoritative list:
+
+https://github.com/icsharpcode/ILSpy/blob/main/doc/third-party-notices.txt
+
+### Bundled GCC Runtime Libraries (`linux-musl-*` only)
+
+Every `linux-musl-*` archive ships the following GCC runtime libraries so that the packages work on minimal musl Linux distributions (such as Alpine) immediately after extraction:
+
+| File                     | Size    | Purpose                  |
+| ------------------------ | ------- | ------------------------ |
+| `libstdc++.so.6`         | ~2.7 MB | C++ standard library     |
+| `libgcc_s.so.1`          | ~170 KB | GCC low-level runtime    |
+
+Provenance:
+
+* Both files are taken **unmodified** from the official Alpine Linux repositories
+  (the `libstdc++` and `libgcc` packages of the `gcc` source package).
+* The exact package versions are recorded in `GCC-RUNTIME-LIBRARIES.txt` inside the archive.
+
+Licensing:
+
+* Upstream GCC distributes these runtime libraries under
+  `GPL-3.0-or-later WITH GCC-exception-3.1` — that is, the GNU General Public
+  License version 3 (or, at your option, any later version) together with the
+  **GCC Runtime Library Exception 3.1**.
+* The GCC Runtime Library Exception is an *additional permission* layered on top
+  of the GPL. It is not a standalone license. Its Section 1 explicitly grants
+  "permission to propagate a work of Target Code formed by combining the Runtime
+  Library with Independent Modules", which is what allows these libraries to be
+  shipped inside a non-GPL binary distribution such as this one.
+* Alpine Linux's own package metadata tags the `gcc` source package as
+  `GPL-2.0-or-later AND LGPL-2.1-or-later`. That is Alpine's packaging label for
+  the package as a whole; the authoritative license of the shipped
+  `libstdc++.so.6` and `libgcc_s.so.1` files is the upstream GCC statement above.
+* The archives carry these files **unmodified**; only the ELF binaries that
+  depend on them are patched with `RPATH=$ORIGIN`.
+
+Obligations when redistributing:
+
+* The GPL and the exception require that the license texts travel with the
+  binaries. `LICENSE-GCC-RUNTIME-LIBRARY.txt` therefore embeds the **complete text**
+  of the GPLv3 and of the GCC Runtime Library Exception 3.1, rather than only
+  linking to them.
+* Alpine's binary repository does not ship license files inside the package, and
+  the base image contains no `/usr/share/licenses` directory at all, so the license
+  texts must be embedded explicitly at packaging time.
+
+If your system already provides these two libraries, the copies inside the archive are not used and can be safely deleted.
+
+> Note: `RPATH=$ORIGIN` is injected into the ELF binaries that depend on these two libraries, so the musl loader can find them in the package directory.
 
 ## Disclaimer
 
-This project is provided for convenience and binary distribution purposes.
+This project is provided as-is, primarily to make it easier to obtain automated builds of ILSpy.
 
-It is:
+Because differences may exist across ILSpy versions, operating systems, CPU architectures, and native dependencies:
 
-* **not an official ILSpy distribution**
-* **not affiliated with the ILSpy maintainers**
-* **not a replacement for the upstream ILSpy repository**
+* No guarantee is made that every platform runs correctly on every Linux distribution
+* No guarantee is made that every musl-based Linux environment is fully compatible
+* No guarantee is made that every future upstream ILSpy version can be built without modification
 
-For source code, official releases, issue tracking, development, and project information, please refer to the upstream repository:
-
-https://github.com/icsharpcode/ILSpy
+For formal use, please validate the binaries on the target platform yourself.
 
 ## Contributing
 
-Issues and pull requests related to the automation workflow, packaging, and build infrastructure are welcome.
+Issues and pull requests related to the following topics are welcome:
 
-For bugs or feature requests concerning ILSpy itself, please report them to the upstream ILSpy project instead:
+* GitHub Actions
+* Automatic version detection
+* Multi-platform builds
+* ZIP packaging
+* Automatic release publishing
+* Build environment and scripts
+* Binary publishing pipeline
+
+For questions about ILSpy itself, its bugs, or development, please go to the upstream project:
 
 https://github.com/icsharpcode/ILSpy/issues

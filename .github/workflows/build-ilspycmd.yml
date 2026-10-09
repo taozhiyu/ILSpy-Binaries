@@ -35,7 +35,7 @@ name: Build & Release ilspycmd (self-contained)
 
 on:
   schedule:
-    - cron: '6 2 * * 5'
+    - cron: '47 2 * * *'
   workflow_dispatch:
     inputs:
       force_version:
